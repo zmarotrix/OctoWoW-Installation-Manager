@@ -1,0 +1,15 @@
+# Ignore the Payload directory and its contents
+Payload/
+
+# Ignore Executables and Icons
+vanilla-tweaks.exe
+build.bat
+
+# Ignore PyInstaller build cache and output folders
+build/
+dist/
+*.spec
+
+# Ignore Python cache
+__pycache__/
+*.pyc
