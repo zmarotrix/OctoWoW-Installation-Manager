@@ -8,16 +8,19 @@ import threading
 import queue
 import urllib.request
 import zipfile
+import io
 import re
+import hashlib
+import ssl
+import socket
 import tkinter as tk
 from tkinter import filedialog, messagebox
 import customtkinter as ctk
 
 # --- CONFIGURATION ---
-APP_REPO_API = "https://api.github.com/repos/YourUsername/OctoWow-Install-Manager/releases/latest"
 CLIENT_ZIP_URL = "https://your-server.com/OctoWoW_Client.zip" # <-- CHANGE THIS TO YOUR ACTUAL CLIENT ZIP URL
 CONFIG_FILE = "octowow_config.json"
-VERSION = "2.2"
+VERSION = "2.3.1"
 
 # --- THEME COLORS ---
 BG_COLOR = "#0B0F19"         
@@ -161,14 +164,11 @@ class GitManager:
         """Forces a clean pull/update regardless of local file changes."""
         if os.path.exists(os.path.join(target_path, ".git")):
             subprocess.run(["git", "-C", target_path, "fetch", "--all"], check=True, timeout=30, creationflags=subprocess.CREATE_NO_WINDOW)
-            try:
-                subprocess.run(["git", "-C", target_path, "reset", "--hard", "@{u}"], check=True, timeout=30, creationflags=subprocess.CREATE_NO_WINDOW)
-            except:
-                subprocess.run(["git", "-C", target_path, "reset", "--hard", "FETCH_HEAD"], check=True, timeout=30, creationflags=subprocess.CREATE_NO_WINDOW)
+            try: subprocess.run(["git", "-C", target_path, "reset", "--hard", "@{u}"], check=True, timeout=30, creationflags=subprocess.CREATE_NO_WINDOW)
+            except: subprocess.run(["git", "-C", target_path, "reset", "--hard", "FETCH_HEAD"], check=True, timeout=30, creationflags=subprocess.CREATE_NO_WINDOW)
         else:
             if os.path.exists(target_path): shutil.rmtree(target_path)
-            if url:
-                subprocess.run(["git", "clone", url, target_path], check=True, timeout=60, creationflags=subprocess.CREATE_NO_WINDOW)
+            if url: subprocess.run(["git", "clone", url, target_path], check=True, timeout=60, creationflags=subprocess.CREATE_NO_WINDOW)
 
 # ==========================================
 # 3. VIEW & CONTROLLER: UI AND INSTALL LOGIC
@@ -177,13 +177,12 @@ class OctoWowApp(ctk.CTk):
     def __init__(self):
         super().__init__()
         self.title(f"OctoWoW Install Manager v{VERSION}")
-        self.geometry("1050x750")
+        self.geometry("1050x780")
         self.resizable(False, False)
         self.configure(fg_color=BG_COLOR)
 
         icon_path = os.path.join(get_base_path(), "PurpleWowLogo.ico")
-        if os.path.exists(icon_path):
-            self.iconbitmap(icon_path)
+        if os.path.exists(icon_path): self.iconbitmap(icon_path)
 
         self.config = ConfigManager()
         self.msg_queue = queue.Queue()
@@ -191,18 +190,13 @@ class OctoWowApp(ctk.CTk):
         self.client_dl_window = None
         
         self.addon_cards = []
-        self.upd_header = None
-        self.inst_header = None
-        self.no_results_lbl = None
-        self.btn_upd_all = None
         self.is_scanning_addons = False
         self.current_addon_data = [] 
         
         self.init_variables()
         self.build_ui()
         self.after(100, self.process_queue)
-        
-        self.trigger_addon_scan(show_loading=True)
+        self.trigger_addon_scan(show_loading=False)
 
     def init_variables(self):
         self.descriptions = {
@@ -298,11 +292,16 @@ class OctoWowApp(ctk.CTk):
 
     def toggle_safety_limits(self):
         override = self.safety_override.get()
-        for slider, safe_max, extreme_max, var in self.slider_widgets:
-            if override: slider.configure(to=extreme_max)
+        for slider, safe_max, extreme_max, var, val_lbl in self.slider_widgets:
+            if override:
+                slider.configure(to=extreme_max)
             else:
                 slider.configure(to=safe_max)
-                if var.get() > safe_max: var.set(safe_max)
+                if var.get() > safe_max:
+                    var.set(safe_max)
+            # Force UI update
+            slider.set(var.get())
+            val_lbl.configure(text=str(int(var.get())))
 
     def save_all_state(self, *args):
         self.config.set('wow_dir', self.wow_dir.get())
@@ -343,7 +342,7 @@ class OctoWowApp(ctk.CTk):
             ("⚙️ Game Settings", "Settings", self.show_settings),
             ("🔌 Client Mods", "Mods", self.show_mods),
             ("📦 Addon Manager", "Addons", self.show_addons),
-            ("🚀 App Updates", "Updater", self.show_updater)
+            ("🚀 Game Updates", "Updater", self.show_updater)
         ]
         
         for i, (label, name, cmd) in enumerate(nav_items):
@@ -460,7 +459,7 @@ class OctoWowApp(ctk.CTk):
         current_max = extreme_max if self.safety_override.get() else safe_max
         slider = ctk.CTkSlider(row, from_=min_val, to=current_max, variable=var, command=update_lbl, button_color=ACCENT_COLOR, button_hover_color=ACCENT_HOVER, progress_color=CARD_COLOR)
         slider.pack(side="right", fill="x", expand=True, padx=15)
-        self.slider_widgets.append((slider, safe_max, extreme_max, var))
+        self.slider_widgets.append((slider, safe_max, extreme_max, var, val_lbl))
 
     def browse_dir(self):
         d = filedialog.askdirectory(title="Select Vanilla 1.12 WoW Folder")
@@ -469,67 +468,143 @@ class OctoWowApp(ctk.CTk):
             self.save_all_state()
             self.trigger_addon_scan(show_loading=True)
 
-    # --- CLIENT DOWNLOADER ---
+    # --- CLIENT BITTORRENT DOWNLOADER / UPDATER ---
     def install_new_client(self):
         target = filedialog.askdirectory(title="Select an Empty Folder to Install OctoWoW")
         if not target: return
         
         if os.listdir(target):
-            if not messagebox.askyesno("Folder Not Empty", "The selected folder is not empty. Do you want to continue extracting here anyway?"):
+            if not messagebox.askyesno("Folder Not Empty", "The selected folder is not empty. Do you want to continue syncing the game here anyway?"):
                 return
                 
         self.wow_dir.set(os.path.normpath(target))
         self.save_all_state()
         
         self.client_dl_window = ctk.CTkToplevel(self)
-        self.client_dl_window.title("Downloading Client")
-        self.client_dl_window.geometry("500x200")
+        self.client_dl_window.title("Downloading OctoWoW Client")
+        self.client_dl_window.geometry("550x400")
         self.client_dl_window.resizable(False, False)
         self.client_dl_window.attributes("-topmost", True)
         
-        x = self.winfo_x() + (self.winfo_width() // 2) - 250
-        y = self.winfo_y() + (self.winfo_height() // 2) - 100
+        x = self.winfo_x() + (self.winfo_width() // 2) - 275
+        y = self.winfo_y() + (self.winfo_height() // 2) - 200
         self.client_dl_window.geometry(f"+{x}+{y}")
         
-        ctk.CTkLabel(self.client_dl_window, text="Downloading OctoWoW Client", font=("Segoe UI", 16, "bold"), text_color=ACCENT_COLOR).pack(pady=(20, 5))
-        self.dl_status = ctk.CTkLabel(self.client_dl_window, text="Connecting to server...", text_color=TEXT_MUTED)
+        ctk.CTkLabel(self.client_dl_window, text="Downloading OctoWoW Client via BitTorrent", font=("Segoe UI", 16, "bold"), text_color=ACCENT_COLOR).pack(pady=(20, 5))
+        self.dl_status = ctk.CTkLabel(self.client_dl_window, text="Connecting to seeders...", text_color=TEXT_MUTED)
         self.dl_status.pack(pady=5)
         
-        self.dl_prog = ctk.CTkProgressBar(self.client_dl_window, width=400, progress_color=ACCENT_COLOR)
+        self.dl_prog = ctk.CTkProgressBar(self.client_dl_window, width=450, progress_color=ACCENT_COLOR)
         self.dl_prog.set(0)
         self.dl_prog.pack(pady=15)
         
-        threading.Thread(target=self._install_client_thread, args=(target,), daemon=True).start()
+        self.dl_console = ctk.CTkTextbox(self.client_dl_window, width=480, height=140, fg_color=BG_COLOR, text_color=TEXT_MUTED, font=("Consolas", 11), state="disabled")
+        self.dl_console.pack(pady=(0, 15))
+        
+        threading.Thread(target=self._sync_client_thread, args=(target, None, True), daemon=True).start()
 
-    def _install_client_thread(self, target_dir):
-        temp_zip = os.path.join(target_dir, "client_temp.zip")
+    def ensure_aria2c(self):
+        aria_path = os.path.join(get_persist_path(), "aria2c.exe")
+        if os.path.exists(aria_path): return aria_path
+        
+        self.msg_queue.put(("client_dl_progress", (0, "Downloading BitTorrent engine...")))
+        url = "https://github.com/aria2/aria2/releases/download/release-1.37.0/aria2-1.37.0-win-32bit-build1.zip"
+        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+        with urllib.request.urlopen(req) as resp:
+            data = resp.read()
+            
+        with zipfile.ZipFile(io.BytesIO(data)) as zf:
+            for name in zf.namelist():
+                if name.endswith("aria2c.exe"):
+                    with open(aria_path, "wb") as f: f.write(zf.read(name))
+                    break
+        return aria_path
+
+    def _sync_client_thread(self, target_dir, new_hash=None, is_new_install=False):
         try:
-            req = urllib.request.Request(CLIENT_ZIP_URL, headers={'User-Agent': 'OctoWow-Manager'})
-            with urllib.request.urlopen(req, timeout=15) as response, open(temp_zip, 'wb') as out_file:
-                total_size = int(response.info().get('Content-Length', 0))
-                downloaded = 0
-                chunk_size = 8192 * 4
-
-                while True:
-                    chunk = response.read(chunk_size)
-                    if not chunk: break
-                    out_file.write(chunk)
-                    downloaded += len(chunk)
-                    
-                    if total_size > 0:
-                        pct = downloaded / total_size
-                        self.msg_queue.put(("client_dl_progress", (pct, f"Downloading: {int(pct*100)}%  ({downloaded//1048576} MB / {total_size//1048576} MB)")))
-
-            self.msg_queue.put(("client_dl_progress", (1.0, "Extracting Client (This may take several minutes)...")))
-            
-            with zipfile.ZipFile(temp_zip, 'r') as zf:
-                zf.extractall(target_dir)
+            if not new_hash:
+                import socket
+                socket.setdefaulttimeout(10)
                 
-            os.remove(temp_zip)
-            self.msg_queue.put(("client_dl_done", None))
+                ctx = ssl.create_default_context()
+                ctx.check_hostname = False
+                ctx.verify_mode = ssl.CERT_NONE
+                
+                req = urllib.request.Request("https://dl.octowow.st/download/client.torrent", headers={'User-Agent': 'OctoUpdater/1.3.1'})
+                with urllib.request.urlopen(req, timeout=10, context=ctx) as resp:
+                    torrent_data = resp.read()
+                    new_hash = hashlib.sha1(torrent_data).hexdigest()
+                    
+            aria_path = self.ensure_aria2c()
+            torrent_url = "https://dl.octowow.st/download/client.torrent"
             
+            cmd = [
+                aria_path,
+                f"--dir={target_dir}",
+                "--seed-time=0",
+                "--allow-overwrite=true",
+                "--auto-file-renaming=false",
+                "--summary-interval=1",
+                "--truncate-console-readout=false",
+                "--console-log-level=info",
+                "--check-integrity=true",
+                "--continue=true",
+                torrent_url
+            ]
+            
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, creationflags=subprocess.CREATE_NO_WINDOW)
+            
+            # Custom non-blocking byte reader to catch BitTorrent '\r' overwrites
+            buffer = ""
+            while True:
+                char = proc.stdout.read(1)
+                if not char and proc.poll() is not None:
+                    break
+                    
+                if char in ('\r', '\n'):
+                    line_clean = buffer.strip()
+                    if line_clean:
+                        # Match progress fractions: e.g. 1.1GiB/11GiB(9%)
+                        frac_match = re.search(r'([0-9.]+[KMGTP]?i?B|0B)/([0-9.]+[KMGTP]?i?B|0B)\((\d+)%\)', line_clean, re.IGNORECASE)
+                        
+                        if frac_match:
+                            dl_amt, total_amt, pct = frac_match.groups()
+                            if "Checksum" in line_clean or "verify" in line_clean.lower():
+                                self.msg_queue.put(("client_dl_progress", (int(pct)/100.0, f"Verifying Existing Files... {pct}% | {dl_amt} / {total_amt}")))
+                            else:
+                                spd_match = re.search(r'DL:([^\s\]]+)', line_clean)
+                                eta_match = re.search(r'ETA:([^\]\s]+)', line_clean)
+                                speed = spd_match.group(1) if spd_match else "0B"
+                                eta = eta_match.group(1) if eta_match else "Unknown"
+                                txt = f"Downloading Game Data... {pct}%\nSpeed: {speed}/s | ETA: {eta} | {dl_amt} / {total_amt}"
+                                self.msg_queue.put(("client_dl_progress", (int(pct)/100.0, txt)))
+                        else:
+                            comp_match = re.search(r'Download complete:\s*(.+)', line_clean, re.IGNORECASE)
+                            alloc_match = re.search(r'Allocating disk space.*\s(.+)', line_clean, re.IGNORECASE)
+
+                            if comp_match:
+                                fname = os.path.basename(comp_match.group(1).strip())
+                                # Ignore the internal notification that it fetched the .torrent file
+                                if fname and not fname.endswith('.torrent'):
+                                    self.msg_queue.put(("client_dl_file", f"[✔️] Verified/Completed: {fname}"))
+                            elif alloc_match:
+                                fname = os.path.basename(alloc_match.group(1).strip())
+                                if fname: self.msg_queue.put(("client_dl_file", f"[⚙️] Allocating space for: {fname}"))
+                            elif "Checksum error" in line_clean:
+                                self.msg_queue.put(("client_dl_file", f"[⚠️] Checksum mismatch found, repairing..."))
+                    buffer = ""
+                else:
+                    buffer += char
+
+            proc.wait()
+            
+            if proc.returncode == 0:
+                if new_hash:
+                    self.config.set('client_hash', new_hash)
+                self.msg_queue.put(("client_dl_done", is_new_install))
+            else:
+                self.msg_queue.put(("client_dl_error", f"Update failed (aria2c error code {proc.returncode})"))
         except Exception as e:
-            if os.path.exists(temp_zip): os.remove(temp_zip)
             self.msg_queue.put(("client_dl_error", str(e)))
 
     # --- MODS TAB ---
@@ -583,12 +658,10 @@ class OctoWowApp(ctk.CTk):
         top = ctk.CTkFrame(frame, fg_color="transparent")
         top.pack(fill="x", padx=10, pady=(10, 5))
         ctk.CTkLabel(top, text="Addon Manager", font=("Segoe UI", 24, "bold"), text_color=TEXT_MAIN).pack(side="left")
-        
         ctk.CTkButton(top, text="🔄 Check for Updates", fg_color=CARD_COLOR, hover_color="#2A2E3F", font=("Segoe UI", 12, "bold"), command=lambda: self.trigger_addon_scan(show_loading=True)).pack(side="right")
 
         ctk.CTkLabel(frame, text="Automatically scans your WoW directory. Add a Git URL to install new addons.", text_color=TEXT_MUTED).pack(anchor="w", padx=10, pady=(0, 15))
 
-        # Input & Search Row
         ctrl_frame = ctk.CTkFrame(frame, fg_color="transparent")
         ctrl_frame.pack(fill="x", padx=10, pady=(10, 15))
 
@@ -621,8 +694,7 @@ class OctoWowApp(ctk.CTk):
         
         threading.Thread(target=self.scan_addons_thread, daemon=True).start()
 
-    def strip_wow_colors(self, text):
-        return re.sub(r'\|c[0-9a-fA-F]{8}|\|r', '', text).strip()
+    def strip_wow_colors(self, text): return re.sub(r'\|c[0-9a-fA-F]{8}|\|r', '', text).strip()
 
     def parse_toc(self, toc_path):
         metadata = {"Title": "", "Version": "Unknown", "Notes": "No description provided.", "Author": "Unknown"}
@@ -634,8 +706,7 @@ class OctoWowApp(ctk.CTk):
                         parts = line[2:].split(":", 1)
                         if len(parts) == 2:
                             key = parts[0].strip()
-                            if key in metadata:
-                                metadata[key] = self.strip_wow_colors(parts[1])
+                            if key in metadata: metadata[key] = self.strip_wow_colors(parts[1])
         except: pass
         return metadata
 
@@ -741,16 +812,14 @@ class OctoWowApp(ctk.CTk):
             self.no_results_lbl.pack(pady=40)
 
     def create_addon_card_widget(self, addon):
-        card = ctk.CTkFrame(self.addon_scroll, fg_color=SURFACE_COLOR, corner_radius=8)
-        
-        top_frame = ctk.CTkFrame(card, fg_color="transparent")
-        top_frame.pack(fill="x")
-        top_frame.grid_columnconfigure(1, weight=1)
+        card = ctk.CTkFrame(self.addon_scroll, fg_color=SURFACE_COLOR, corner_radius=8, height=75)
+        card.pack_propagate(False)
+        card.grid_columnconfigure(1, weight=1)
         
         icon_color = ACCENT_COLOR if addon["managed"] else TEXT_MUTED
-        ctk.CTkLabel(top_frame, text="📦", font=("Segoe UI", 24), text_color=icon_color).grid(row=0, column=0, padx=(15, 10), pady=18)
+        ctk.CTkLabel(card, text="📦", font=("Segoe UI", 24), text_color=icon_color).grid(row=0, column=0, padx=(15, 10), pady=18)
         
-        info_frame = ctk.CTkFrame(top_frame, fg_color="transparent")
+        info_frame = ctk.CTkFrame(card, fg_color="transparent")
         info_frame.grid(row=0, column=1, sticky="w", pady=15)
         
         title_color = TEXT_MAIN if not addon["missing"] else ERROR_COLOR
@@ -761,7 +830,7 @@ class OctoWowApp(ctk.CTk):
         sub_lbl = ctk.CTkLabel(info_frame, text=sub_text, font=("Segoe UI", 11), text_color=TEXT_MUTED)
         sub_lbl.pack(anchor="w")
 
-        btn_frame = ctk.CTkFrame(top_frame, fg_color="transparent")
+        btn_frame = ctk.CTkFrame(card, fg_color="transparent")
         btn_frame.grid(row=0, column=2, sticky="e", padx=15, pady=18)
         
         upd_btn = None
@@ -867,7 +936,7 @@ class OctoWowApp(ctk.CTk):
         for c in updates:
             addon = c['data']
             ui = c['frame'].ui_elements
-            if ui['upd_btn'].winfo_ismapped():
+            if ui['upd_btn'] and ui['upd_btn'].winfo_ismapped():
                 self.start_single_update(addon, ui['upd_btn'], ui['pb'])
 
     def rescan_single_addon(self, folder):
@@ -911,11 +980,10 @@ class OctoWowApp(ctk.CTk):
         btn_del.pack(side="left")
         CTkToolTip(btn_del, "Uninstall Addon")
 
-        # If no updates remain, hide the update all button
         if not any(c['type'] == 'update' for c in self.addon_cards):
             self.btn_upd_all.pack_forget()
 
-    # --- APP UPDATER TAB ---
+    # --- GAME UPDATER TAB ---
     def show_updater(self):
         self.select_nav_btn("Updater")
         self.hide_all_frames()
@@ -928,92 +996,73 @@ class OctoWowApp(ctk.CTk):
         center = ctk.CTkFrame(frame, fg_color="transparent")
         center.pack(expand=True)
 
-        ctk.CTkLabel(center, text="OctoWoW Install Manager Updates", font=("Segoe UI", 24, "bold"), text_color=TEXT_MAIN).pack(pady=(0, 5))
-        ctk.CTkLabel(center, text=f"Current Version: {VERSION}", font=("Segoe UI", 14), text_color=TEXT_MUTED).pack(pady=(0, 40))
+        ctk.CTkLabel(center, text="OctoWoW Client Updater", font=("Segoe UI", 24, "bold"), text_color=TEXT_MAIN).pack(pady=(0, 5))
+        ctk.CTkLabel(center, text="Synchronizes your core game files directly with the official OctoWoW torrent network.", font=("Segoe UI", 13), text_color=TEXT_MUTED).pack(pady=(0, 30))
         
-        self.lbl_update_status = ctk.CTkLabel(center, text="Ready to check for updates.", font=("Segoe UI", 12))
-        self.lbl_update_status.pack(pady=10)
+        self.lbl_update_status = ctk.CTkLabel(center, text="Ready.", font=("Segoe UI", 13, "bold"), text_color=TEXT_MAIN)
+        self.lbl_update_status.pack(pady=(10, 5))
         
-        self.progress_update = ctk.CTkProgressBar(center, width=400, progress_color=ACCENT_COLOR, fg_color=CARD_COLOR)
+        self.progress_update = ctk.CTkProgressBar(center, width=450, progress_color=ACCENT_COLOR, fg_color=CARD_COLOR)
         self.progress_update.set(0)
-        self.progress_update.pack(pady=20)
+        self.progress_update.pack(pady=10)
+
+        self.updater_console = ctk.CTkTextbox(center, width=480, height=120, fg_color=BG_COLOR, text_color=TEXT_MUTED, font=("Consolas", 11), state="disabled")
+        self.updater_console.pack(pady=(10, 20))
         
-        self.btn_check_update = ctk.CTkButton(center, text="🚀 Check for Updates", font=("Segoe UI", 14, "bold"), height=45, fg_color=ACCENT_COLOR, hover_color=ACCENT_HOVER, command=self.check_updates)
-        self.btn_check_update.pack(pady=20)
+        self.btn_check_update = ctk.CTkButton(center, text="🚀 Check for Game Updates", font=("Segoe UI", 14, "bold"), height=45, fg_color=ACCENT_COLOR, hover_color=ACCENT_HOVER, command=self.check_updates)
+        self.btn_check_update.pack(pady=10)
 
     def check_updates(self):
+        wow_dir = self.wow_dir.get().strip()
+        if not wow_dir or not os.path.exists(os.path.join(wow_dir, "WoW.exe")):
+            messagebox.showerror("Error", "Please set a valid WoW directory in the Game Settings tab first.")
+            return
+
         self.btn_check_update.configure(state="disabled")
-        self.lbl_update_status.configure(text="Checking GitHub...")
+        self.lbl_update_status.configure(text="Checking OctoWoW servers...")
         threading.Thread(target=self._check_updates_thread, daemon=True).start()
 
     def _check_updates_thread(self):
         try:
-            req = urllib.request.Request(APP_REPO_API, headers={'User-Agent': 'OctoWow-Manager'})
-            with urllib.request.urlopen(req, timeout=10) as response:
-                data = json.loads(response.read().decode())
+            import socket
+            socket.setdefaulttimeout(10)
+            
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            
+            req = urllib.request.Request("https://dl.octowow.st/download/client.torrent", headers={'User-Agent': 'OctoUpdater/1.3.1'})
+            with urllib.request.urlopen(req, timeout=10, context=ctx) as resp:
+                torrent_data = resp.read()
+                latest_hash = hashlib.sha1(torrent_data).hexdigest()
                 
-                latest_version = data.get("tag_name", "").lstrip("v")
-                zip_url = data.get("zipball_url")
-                
-                if latest_version > VERSION and zip_url:
-                    self.msg_queue.put(("updater_prompt", (latest_version, zip_url)))
-                else:
-                    self.msg_queue.put(("updater_status", "You are running the latest version!"))
-                    self.msg_queue.put(("updater_btn", "normal"))
+            current_hash = self.config.get('client_hash', '')
+            
+            if latest_hash != current_hash:
+                self.msg_queue.put(("updater_prompt", latest_hash))
+            else:
+                self.msg_queue.put(("updater_status", "Your OctoWoW client is completely up to date!"))
+                self.msg_queue.put(("updater_btn", "normal"))
         except Exception as e:
-            self.msg_queue.put(("updater_status", "Failed to check for updates (API limit or network error)."))
+            self.msg_queue.put(("updater_status", "Failed to reach servers. Please check connection."))
             self.msg_queue.put(("updater_btn", "normal"))
 
-    def prompt_download_update(self, latest_version, zip_url):
-        if messagebox.askyesno("Update Available", f"Version {latest_version} is available!\n\nWould you like to download and install it now?"):
-            self.lbl_update_status.configure(text="Downloading update...")
+    def prompt_download_update(self, new_hash):
+        if messagebox.askyesno("Game Update Available", "An update to the base OctoWoW client is available!\n\nWould you like to synchronize and download it now?"):
+            self.lbl_update_status.configure(text="Starting BitTorrent engine...")
             self.progress_update.set(0)
-            threading.Thread(target=self._download_update_thread, args=(zip_url,), daemon=True).start()
+            
+            self.updater_console.configure(state="normal")
+            self.updater_console.delete("1.0", "end")
+            self.updater_console.configure(state="disabled")
+            
+            target_dir = self.wow_dir.get().strip()
+            threading.Thread(target=self._sync_client_thread, args=(target_dir, new_hash, False), daemon=True).start()
         else:
             self.lbl_update_status.configure(text="Update cancelled.")
             self.btn_check_update.configure(state='normal')
 
-    def _download_update_thread(self, zip_url):
-        try:
-            req = urllib.request.Request(zip_url, headers={'User-Agent': 'OctoWow-Manager'})
-            with urllib.request.urlopen(req, timeout=15) as response:
-                total_size = int(response.info().get('Content-Length', 0))
-                downloaded = 0
-                chunk_size = 8192
-                data = io.BytesIO()
-
-                while True:
-                    chunk = response.read(chunk_size)
-                    if not chunk: break
-                    data.write(chunk)
-                    downloaded += len(chunk)
-                    if total_size > 0:
-                        self.msg_queue.put(("updater_progress", downloaded / total_size))
-
-                persist_dir = get_persist_path()
-                
-                with zipfile.ZipFile(data) as zf:
-                    root_folder = zf.namelist()[0] 
-                    for member in zf.namelist():
-                        if member == root_folder: continue
-                        target_path = os.path.join(persist_dir, member.replace(root_folder, "", 1))
-                        
-                        if member.endswith('/'): os.makedirs(target_path, exist_ok=True)
-                        else:
-                            os.makedirs(os.path.dirname(target_path), exist_ok=True)
-                            if os.path.exists(target_path) and target_path.endswith('.exe'):
-                                try: os.rename(target_path, target_path + ".old")
-                                except: pass
-                            with zf.open(member) as source, open(target_path, "wb") as target:
-                                shutil.copyfileobj(source, target)
-                                
-            self.msg_queue.put(("updater_status", "Update successful! Please restart the application."))
-            self.msg_queue.put(("updater_done", None))
-        except Exception as e:
-            self.msg_queue.put(("updater_status", f"Update failed: {e}"))
-            self.msg_queue.put(("updater_btn", "normal"))
-
-    # --- INSTALLATION LOGIC ---
+    # --- INSTALLATION & DEPLOYMENT LOGIC ---
     def validate_installation_dir(self, target_dir):
         if not target_dir:
             messagebox.showerror("Directory Error", "Please select a Vanilla 1.12 installation directory.")
@@ -1171,7 +1220,7 @@ oLink.Save
         finally:
             if os.path.exists(vbs_path): os.remove(vbs_path)
 
-    def run_installation(self):
+    def run_installation(self, silent=False):
         self.save_all_state()
         target_dir = self.wow_dir.get().strip()
         if not self.validate_installation_dir(target_dir): return
@@ -1186,9 +1235,11 @@ oLink.Save
             self.apply_corrupt_interface_bypass(target_dir)
             self.apply_process_mitigations()
             self.create_launcher_shortcut(target_dir)
-            messagebox.showinfo("Success", "Installation and patching complete!\n\nYou can launch the game using the PLAY GAME button.")
+            if not silent:
+                messagebox.showinfo("Success", "Installation and patching complete!\n\nYou can launch the game using the PLAY GAME button.")
         except Exception as e:
-            messagebox.showerror("Installation Error", str(e))
+            if not silent:
+                messagebox.showerror("Installation Error", str(e))
 
     def launch_game(self):
         target_dir = self.wow_dir.get().strip()
@@ -1211,39 +1262,63 @@ oLink.Save
             while True:
                 msg_type, data = self.msg_queue.get_nowait()
                 if msg_type == "render_addons":
-                    self.current_addon_data = data
                     self.is_scanning_addons = False
                     self.build_all_addon_cards(data)
                 elif msg_type == "single_update_done":
                     folder, success = data
                     if not success: messagebox.showerror("Update Failed", f"Failed to update {folder}. Please check your internet connection or repository URL.")
                     self.rescan_single_addon(folder)
+                elif msg_type == "sync_progress":
+                    if hasattr(self, 'sync_lbl'): self.sync_lbl.configure(text=data)
+                elif msg_type == "sync_complete":
+                    self.trigger_addon_scan(show_loading=True)
                 elif msg_type == "client_dl_progress":
                     pct, txt = data
                     if self.client_dl_window and self.client_dl_window.winfo_exists():
                         self.dl_prog.set(pct)
                         self.dl_status.configure(text=txt)
+                    else:
+                        self.progress_update.set(pct)
+                        self.lbl_update_status.configure(text=txt)
+                elif msg_type == "client_dl_file":
+                    if self.client_dl_window and self.client_dl_window.winfo_exists():
+                        self.dl_console.configure(state="normal")
+                        self.dl_console.insert("end", data + "\n")
+                        self.dl_console.see("end")
+                        self.dl_console.configure(state="disabled")
+                    else:
+                        if hasattr(self, 'updater_console'):
+                            self.updater_console.configure(state="normal")
+                            self.updater_console.insert("end", data + "\n")
+                            self.updater_console.see("end")
+                            self.updater_console.configure(state="disabled")
                 elif msg_type == "client_dl_done":
+                    is_new_install = data
                     if self.client_dl_window and self.client_dl_window.winfo_exists():
                         self.client_dl_window.destroy()
-                    messagebox.showinfo("Success", "OctoWoW Client downloaded and extracted successfully!")
-                    self.trigger_addon_scan(show_loading=True)
+                    
+                    self.run_installation(silent=True)
+                    
+                    msg = "OctoWoW downloaded successfully!" if is_new_install else "OctoWoW client download and synchronization complete!\nYour mods and tweaks have been automatically re-applied."
+                    messagebox.showinfo("Success", msg)
+                    
+                    if not is_new_install:
+                        self.lbl_update_status.configure(text="Update complete.")
+                        self.progress_update.set(1.0)
+                        self.btn_check_update.configure(state="normal")
+                    self.trigger_addon_scan(show_loading=False)
                 elif msg_type == "client_dl_error":
                     if self.client_dl_window and self.client_dl_window.winfo_exists():
                         self.client_dl_window.destroy()
-                    messagebox.showerror("Download Error", f"Failed to download client: {data}")
+                    self.lbl_update_status.configure(text=data)
+                    self.btn_check_update.configure(state="normal")
+                    messagebox.showerror("Download Error", f"Failed to sync client: {data}")
                 elif msg_type == "updater_status":
                     self.lbl_update_status.configure(text=data)
                 elif msg_type == "updater_btn":
                     self.btn_check_update.configure(state=data)
                 elif msg_type == "updater_prompt":
-                    self.prompt_download_update(data[0], data[1])
-                elif msg_type == "updater_progress":
-                    self.progress_update.set(data)
-                elif msg_type == "updater_done":
-                    messagebox.showinfo("Update Complete", "The application has been updated. It will now close. Please relaunch it.")
-                    self.destroy()
-                    sys.exit(0)
+                    self.prompt_download_update(data)
         except queue.Empty: pass
         finally: self.after(100, self.process_queue)
 
