@@ -13,6 +13,9 @@ This tool provides a graphical interface to manage client settings, wraps `vanil
 * **Engine Tweaks & Mods:** Provides toggles for 1.12 modifications including *VanillaFixes*, *UnitXP_SP3*, and the *WeirdUtils* suite.
 
 ---
+<img width="1052" height="782" alt="image" src="https://github.com/user-attachments/assets/aa3bb253-94af-4463-85c0-dc2f981daf70" />
+<img width="1052" height="782" alt="image" src="https://github.com/user-attachments/assets/d76da00e-579e-4207-9057-70fe89210905" />
+
 
 ## For Players: How to Download
 If you are looking to install the game, manage mods, or update your addons, **you do not need to build this from source.**
