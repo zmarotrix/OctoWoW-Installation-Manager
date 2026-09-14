@@ -1,31 +1,30 @@
 # OctoWoW Install Manager
 
-A modern, CustomTkinter-based configuration, modding, and addon management tool tailored specifically for the OctoWoW (Vanilla 1.12.1) client. 
+A configuration, modding, and addon management tool for the OctoWoW (Vanilla 1.12.1) client. 
 
-This manager is built to function like a professional desktop gaming launcher. It provides a sleek graphical interface to manage client settings, wraps `vanilla-tweaks.exe` for deep-engine adjustments (like Widescreen FoV and memory limits), safely deploys core `.dll` engine hooks (like SuperWoW and DXVK), and features a fully threaded **Git Addon Manager** and **Client Downloader**.
-
----
-
-## ✨ Key Features
-* **Modern UI:** Built on `CustomTkinter` with hardware-accelerated smooth scrolling, dark mode styling, and dynamic card-based layouts.
-* **Git Addon Manager:** Automatically scans your `Interface/AddOns` folder, parses `.toc` metadata, and uses Git to seamlessly track, clone, and "Update All" of your addons with a single click.
-* **Client Downloader:** Download and extract the full OctoWoW client `.zip` directly to your PC without leaving the app.
-* **App Auto-Updater:** Built-in self-updating mechanism that checks GitHub releases, downloads the newest version, and patches itself in place.
-* **Engine Tweaks & Mods:** Effortlessly toggle complex 1.12 modifications like *VanillaFixes*, *UnitXP_SP3*, and the *WeirdUtils* suite.
+This tool provides a graphical interface to manage client settings, wraps `vanilla-tweaks.exe` for engine adjustments (such as Widescreen FoV and memory limits), deploys core `.dll` engine hooks (like SuperWoW and DXVK), and handles addon synchronization via Git.
 
 ---
 
-## 🎮 For Players: How to Download
-If you are just looking to install the game or update your addons, **you do not need to build this from source or download the files below.**
-
-Go to the **[Releases](../../releases)** tab on the right side of this GitHub page and download the latest `.exe` file. The release executable comes with the entire payload of DLLs, Addon Dependencies, and executables **pre-installed and packed inside it.**
-
-*(Note: To use the Addon Manager tab, you must have [Git for Windows](https://git-scm.com/download/win) installed on your PC.)*
+## Features
+* **Git Addon Manager:** Scans the `Interface/AddOns` folder, parses `.toc` metadata, and uses Git to track, clone, and update addons in place.
+* **Client Downloader:** Downloads and extracts the OctoWoW client `.zip` directly to the user's local disk.
+* **App Auto-Updater:** Checks GitHub releases to download and apply updates to the manager itself.
+* **Engine Tweaks & Mods:** Provides toggles for 1.12 modifications including *VanillaFixes*, *UnitXP_SP3*, and the *WeirdUtils* suite.
 
 ---
 
-## 🛠️ For Developers: Building from Source
-This repository contains **only the UI source code (`OctoWow_Install_Manager.py`)**. It does not contain the third-party `.dll` payloads or executable patchers required to actually run the compiler. Keeping the payload out of the repository keeps it lightweight and respects the original creators' licenses.
+## For Players: How to Download
+If you are looking to install the game, manage mods, or update your addons, **you do not need to build this from source.**
+
+Go to the **[Releases](../../releases)** tab on the right side of this GitHub page and download the latest `.exe` file. The release executable comes with the necessary DLLs, Addon Dependencies, and patchers pre-packaged inside it.
+
+*(Note: To use the Addon Manager functionality, you must have [Git for Windows](https://git-scm.com/download/win) installed on your system.)*
+
+---
+
+## For Developers: Building from Source
+This repository contains **only the UI source code (`OctoWow_Install_Manager.py`)**. It does not contain the third-party `.dll` payloads or executable patchers required to run the compiler. 
 
 ### Prerequisites
 1. Python 3.8+
@@ -33,7 +32,7 @@ This repository contains **only the UI source code (`OctoWow_Install_Manager.py`
 3. Install PyInstaller: `pip install pyinstaller`
 
 ### Dependency Sources
-*Disclaimer: The links below point to the original repositories. Over time, these may become out-of-date, move, or be deleted. If a link is dead, you will need to source the binary from community archives.*
+*Disclaimer: The links below point to the original repositories. If a link becomes inactive, you will need to source the binary from community archives.*
 
 **Core Engine & Loaders:**
 *   **VanillaFixes (Launcher & DXVK):** [hannesmann/vanillafixes](https://github.com/hannesmann/vanillafixes)
@@ -56,7 +55,7 @@ This repository contains **only the UI source code (`OctoWow_Install_Manager.py`
 *   **Vanilla-Autologin:** [MarcelineVQ/turtle-autologin](https://github.com/MarcelineVQ/turtle-autologin)
 
 ### Required Folder Structure
-Before compiling, your workspace must look exactly like this:
+Before compiling, your workspace must be organized exactly as follows:
 
 ```text
 📁 Project_Root
@@ -94,4 +93,5 @@ Once your payload folder is populated, open your terminal in the root directory 
 ```cmd
 pyinstaller --noconsole --onefile --icon="PurpleWowLogo.ico" --hidden-import customtkinter --add-data "Payload;Payload" --add-data "vanilla-tweaks.exe;." --add-data "PurpleWowLogo.ico;." OctoWow_Install_Manager.py
 ```
-This will generate the final, standalone executable inside the `dist` folder.
+This will generate the standalone executable inside the `dist` folder.
+```
