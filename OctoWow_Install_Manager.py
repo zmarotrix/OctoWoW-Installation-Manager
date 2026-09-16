@@ -13,14 +13,32 @@ import re
 import hashlib
 import ssl
 import socket
+import webbrowser
 import tkinter as tk
 from tkinter import filedialog, messagebox
 import customtkinter as ctk
 
+# --- OPTIONAL DRAG AND DROP ---
+HAS_DND = False
+try:
+    from tkinterdnd2 import TkinterDnD, DND_FILES
+    HAS_DND = True
+except ImportError:
+    pass
+
 # --- CONFIGURATION ---
 CLIENT_ZIP_URL = "https://your-server.com/OctoWoW_Client.zip" # <-- CHANGE THIS TO YOUR ACTUAL CLIENT ZIP URL
 CONFIG_FILE = "octowow_config.json"
-VERSION = "2.3.1"
+VERSION = "2.4"
+
+# Standard Vanilla 1.12 MPQ files that should be ignored by the Game Mods manager
+BASE_MPQ_BLACKLIST = {
+    "backup.mpq", "base.mpq", "dbc.mpq", "fonts.mpq", "interface.mpq", 
+    "misc.mpq", "model.mpq", "patch.mpq", "patch-1.mpq", "patch-2.mpq", 
+    "patch-3.mpq", "patch-4.mpq", "patch-5.mpq", "patch-6.mpq", "patch-7.mpq", 
+    "patch-8.mpq", "patch-9.mpq", "patch-a.mpq", "sound.mpq", "speech.mpq", 
+    "terrain.mpq", "texture.mpq", "wmo.mpq"
+}
 
 # --- THEME COLORS ---
 BG_COLOR = "#0B0F19"         
@@ -80,6 +98,9 @@ class SmoothScrollableFrame(ctk.CTkScrollableFrame):
         self._scroll_multiplier = 0.06  
 
     def _mouse_wheel_all(self, event):
+        # Prevent background tabs from intercepting scroll events
+        if not self.winfo_ismapped(): return 
+        
         x, y = self.winfo_pointerxy()
         rx, ry = self.winfo_rootx(), self.winfo_rooty()
         if not (rx <= x <= rx + self.winfo_width() and ry <= y <= ry + self.winfo_height()): return
@@ -115,6 +136,15 @@ class SmoothScrollableFrame(ctk.CTkScrollableFrame):
         new_y = current_y + (self._target_y - current_y) * 0.18 
         self._parent_canvas.yview_moveto(new_y)
         self.after(16, self._animate_scroll)
+
+if HAS_DND:
+    class BaseApp(ctk.CTk, TkinterDnD.DnDWrapper):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.TkdndVersion = TkinterDnD._require(self)
+else:
+    class BaseApp(ctk.CTk):
+        pass
 
 # ==========================================
 # 1. MODEL: CONFIG MANAGER
@@ -161,7 +191,6 @@ class GitManager:
 
     @staticmethod
     def pull_or_clone(url, target_path):
-        """Forces a clean pull/update regardless of local file changes."""
         if os.path.exists(os.path.join(target_path, ".git")):
             subprocess.run(["git", "-C", target_path, "fetch", "--all"], check=True, timeout=30, creationflags=subprocess.CREATE_NO_WINDOW)
             try: subprocess.run(["git", "-C", target_path, "reset", "--hard", "@{u}"], check=True, timeout=30, creationflags=subprocess.CREATE_NO_WINDOW)
@@ -173,16 +202,25 @@ class GitManager:
 # ==========================================
 # 3. VIEW & CONTROLLER: UI AND INSTALL LOGIC
 # ==========================================
-class OctoWowApp(ctk.CTk):
+class OctoWowApp(BaseApp):
     def __init__(self):
         super().__init__()
-        self.title(f"OctoWoW Install Manager v{VERSION}")
+        
+        # Force Dark Mode globally so Windows Light Theme doesn't turn text invisible
+        ctk.set_appearance_mode("dark")
+        
+        self.title(f"OctoWoW Installation Manager v{VERSION}")
         self.geometry("1050x780")
         self.resizable(False, False)
         self.configure(fg_color=BG_COLOR)
 
         icon_path = os.path.join(get_base_path(), "PurpleWowLogo.ico")
         if os.path.exists(icon_path): self.iconbitmap(icon_path)
+
+        # Allow dropping files anywhere on the app to install MPQs
+        if HAS_DND:
+            self.drop_target_register(DND_FILES)
+            self.dnd_bind('<<Drop>>', self.handle_file_drop)
 
         self.config = ConfigManager()
         self.msg_queue = queue.Queue()
@@ -191,12 +229,16 @@ class OctoWowApp(ctk.CTk):
         
         self.addon_cards = []
         self.is_scanning_addons = False
-        self.current_addon_data = [] 
+        
+        self.pending_mpqs = []
+        self.mpq_temp_dir = os.path.join(get_persist_path(), "temp_mpq_extraction")
+        if os.path.exists(self.mpq_temp_dir): shutil.rmtree(self.mpq_temp_dir, ignore_errors=True)
         
         self.init_variables()
         self.build_ui()
         self.after(100, self.process_queue)
         self.trigger_addon_scan(show_loading=False)
+        self.check_app_updates()
 
     def init_variables(self):
         self.descriptions = {
@@ -236,6 +278,9 @@ class OctoWowApp(ctk.CTk):
         self.gpu_type = ctk.StringVar(value=self.config.get('gpu_type', self.detect_gpu()))
         self.install_autologin = ctk.BooleanVar(value=self.config.get('install_autologin', True))
         self.tracked_addons = self.config.get('tracked_addons', [])
+        
+        # Format: {"MyMod.mpq": {"title": "Cool Mod", "desc": "Does cool things"}}
+        self.game_mods_meta = self.config.get('game_mods_meta', {})
 
         self.core_plugins = {}
         for dll in ["ClassicAPI.dll", "nampower.dll", "no1600x1200.dll", "perf_boost.dll", "SuperWoWhook.dll", "transmogfix.dll", "UnitXP_SP3.dll", "VanillaHelpers.dll", "weirdperformance.dll"]:
@@ -247,15 +292,36 @@ class OctoWowApp(ctk.CTk):
 
         self.addon_dependencies = {"nampower.dll": "nampowersettings", "perf_boost.dll": "perfboostsettings", "UnitXP_SP3.dll": "UnitXP_SP3_Addon", "SuperWoWhook.dll": "SuperAPI"}
 
+        self.GITHUB_MODS = {
+            "ClassicAPI.dll": "brues-code/ClassicAPI",
+            "SuperWoWhook.dll": "balakethelock/SuperWoW",
+            "VanillaHelpers.dll": "isfir/VanillaHelpers"
+        }
+        self.plugin_sources = {}
+        for dll in self.GITHUB_MODS.keys():
+            self.plugin_sources[dll] = ctk.StringVar(value=self.config.get('plugin_sources', {}).get(dll, "Recommended"))
+
         t_conf = self.config.get('tweaks', {})
         self.vt_fov = ctk.DoubleVar(value=t_conf.get('vt_fov', 0))
         
+        # --- Screen Size & Ratio Calculation ---
         self.screen_w = self.winfo_screenwidth()
         self.screen_h = self.winfo_screenheight()
+        
+        # Explicitly fetch primary monitor bounds to prevent dual-monitor ultrawide spanning bugs
+        try:
+            import ctypes
+            self.screen_w = ctypes.windll.user32.GetSystemMetrics(0)
+            self.screen_h = ctypes.windll.user32.GetSystemMetrics(1)
+        except Exception:
+            pass
+
         self.detected_ratio = self.screen_w / self.screen_h
         self.ratio_options = {
             f"Auto ({self.screen_w}x{self.screen_h})": self.detected_ratio,
-            "4:3 (Standard)": 4.0/3.0, "16:9 (Widescreen)": 16.0/9.0, "16:10 (Widescreen)": 16.0/10.0, "21:9 (Ultrawide)": 21.0/9.0, "32:9 (Super Ultrawide)": 32.0/9.0
+            "4:3 (Standard)": 4.0/3.0, "16:9 (Widescreen)": 16.0/9.0, 
+            "16:10 (Widescreen)": 16.0/10.0, "21:9 (Ultrawide)": 21.0/9.0, 
+            "32:9 (Super Ultrawide)": 32.0/9.0
         }
         self.ratio_var = ctk.StringVar(value=t_conf.get('ratio_var', list(self.ratio_options.keys())[0]))
         
@@ -299,7 +365,6 @@ class OctoWowApp(ctk.CTk):
                 slider.configure(to=safe_max)
                 if var.get() > safe_max:
                     var.set(safe_max)
-            # Force UI update
             slider.set(var.get())
             val_lbl.configure(text=str(int(var.get())))
 
@@ -309,7 +374,9 @@ class OctoWowApp(ctk.CTk):
         self.config.set('install_autologin', self.install_autologin.get())
         self.config.set('core_plugins', {k: v.get() for k, v in self.core_plugins.items()})
         self.config.set('optional_plugins', {k: v.get() for k, v in self.optional_plugins.items()})
+        self.config.set('plugin_sources', {k: v.get() for k, v in self.plugin_sources.items()})
         self.config.set('tracked_addons', self.tracked_addons)
+        self.config.set('game_mods_meta', self.game_mods_meta)
         self.config.set('tweaks', {
             'vt_fov': self.vt_fov.get(), 'ratio_var': self.ratio_var.get(), 'vt_farclip': self.vt_farclip.get(),
             'vt_frill': self.vt_frill.get(), 'vt_nameplate': self.vt_nameplate.get(), 'vt_soundchan': self.vt_soundchan.get(),
@@ -326,7 +393,7 @@ class OctoWowApp(ctk.CTk):
         # --- SIDEBAR ---
         self.sidebar = ctk.CTkFrame(self, fg_color=SURFACE_COLOR, width=240, corner_radius=0)
         self.sidebar.grid(row=0, column=0, sticky="nsew")
-        self.sidebar.grid_rowconfigure(5, weight=1) 
+        self.sidebar.grid_rowconfigure(7, weight=1) 
 
         title_frame = ctk.CTkFrame(self.sidebar, fg_color="transparent")
         title_frame.grid(row=0, column=0, padx=20, pady=(30, 25), sticky="w")
@@ -335,57 +402,106 @@ class OctoWowApp(ctk.CTk):
         logo.pack(anchor="w")
         ctk.CTkLabel(logo, text="OCTO", font=("Segoe UI Black", 24), text_color=TEXT_MAIN).pack(side="left")
         ctk.CTkLabel(logo, text="WOW", font=("Segoe UI Black", 24), text_color=ACCENT_COLOR).pack(side="left")
-        ctk.CTkLabel(title_frame, text=f"Install Manager v{VERSION}", font=("Segoe UI", 12), text_color=TEXT_MUTED).pack(anchor="w")
+        ctk.CTkLabel(title_frame, text=f"Installation Manager v{VERSION}", font=("Segoe UI", 12), text_color=TEXT_MUTED).pack(anchor="w")
 
+        # --- OPTIMIZED NAVIGATION GENERATION ---
         self.nav_btns = {}
         nav_items = [
-            ("⚙️ Game Settings", "Settings", self.show_settings),
-            ("🔌 Client Mods", "Mods", self.show_mods),
-            ("📦 Addon Manager", "Addons", self.show_addons),
-            ("🚀 Game Updates", "Updater", self.show_updater)
+            ("⚙️ Game Settings", "Settings"),
+            ("🔌 Client Tweaks", "Tweaks"),
+            ("🎨 Game Mods", "GameMods"),
+            ("📦 Addon Manager", "Addons"),
+            ("🚀 Game Updates", "Updater")
         ]
         
-        for i, (label, name, cmd) in enumerate(nav_items):
+        for i, (label, name) in enumerate(nav_items):
             btn = ctk.CTkButton(self.sidebar, text=f"  {label}", font=("Segoe UI", 14, "bold"), fg_color="transparent", 
-                                text_color=TEXT_MAIN, hover_color=CARD_COLOR, anchor="w", height=45, command=cmd)
+                                text_color=TEXT_MAIN, hover_color=CARD_COLOR, anchor="w", height=45, 
+                                command=lambda n=name: self.show_tab(n))
             btn.grid(row=i+1, column=0, padx=10, pady=4, sticky="ew")
             self.nav_btns[name] = btn
 
+        self.app_update_btn = ctk.CTkButton(self.sidebar, text="🔄 Checking for updates...", font=("Segoe UI", 11, "bold"), 
+                                            fg_color="transparent", hover_color=CARD_COLOR, text_color=TEXT_MUTED, 
+                                            height=30, state="disabled")
+        self.app_update_btn.grid(row=8, column=0, padx=20, pady=(0, 10), sticky="ew")
+
         ctk.CTkButton(self.sidebar, text="💾 Apply Changes", font=("Segoe UI", 14, "bold"), fg_color=CARD_COLOR, hover_color="#2A2E3F",
-                      text_color=TEXT_MAIN, height=45, command=self.run_installation).grid(row=6, column=0, padx=20, pady=(0, 10), sticky="ew")
+                      text_color=TEXT_MAIN, height=45, command=self.run_installation).grid(row=9, column=0, padx=20, pady=(0, 10), sticky="ew")
         
         ctk.CTkButton(self.sidebar, text="▶ PLAY GAME", font=("Segoe UI", 16, "bold"), fg_color=SUCCESS_COLOR, hover_color="#059669",
-                      text_color="#ffffff", height=55, command=self.launch_game).grid(row=7, column=0, padx=20, pady=(0, 30), sticky="ew")
+                      text_color="#ffffff", height=55, command=self.launch_game).grid(row=10, column=0, padx=20, pady=(0, 30), sticky="ew")
 
         # --- MAIN CONTENT AREA ---
         self.main_container = ctk.CTkFrame(self, fg_color=BG_COLOR, corner_radius=0)
         self.main_container.grid(row=0, column=1, sticky="nsew", padx=10, pady=10)
         
+        # Configure grid for perfectly overlapping tabs
+        self.main_container.grid_rowconfigure(0, weight=1)
+        self.main_container.grid_columnconfigure(0, weight=1)
+        
         self.frames = {}
+        self.current_tab = None  # Track state to prevent unnecessary redraws
+        
         self.build_settings_tab()
-        self.build_mods_tab()
+        self.build_tweaks_tab()
+        self.build_game_mods_tab()
         self.build_addons_tab()
         self.build_updater_tab()
         
-        self.show_settings()
+        self.show_tab("Settings")
 
-    def select_nav_btn(self, name):
+
+    # --- INSTANT, GLITCH-FREE TAB SWITCHING ---
+    def show_tab(self, tab_name):
+        if self.current_tab == tab_name:
+            return  # Do nothing if already on this tab
+
+        # Update button colors
         for btn_name, btn in self.nav_btns.items():
-            if btn_name == name: btn.configure(fg_color=ACCENT_COLOR, hover_color=ACCENT_HOVER)
-            else: btn.configure(fg_color="transparent", hover_color=CARD_COLOR)
+            if btn_name == tab_name: 
+                btn.configure(fg_color=ACCENT_COLOR, hover_color=ACCENT_HOVER)
+            else: 
+                btn.configure(fg_color="transparent", hover_color=CARD_COLOR)
 
-    def hide_all_frames(self):
-        for frame in self.frames.values(): frame.pack_forget()
+        # Remove the old frame completely from view using grid_remove (faster than pack_forget)
+        if self.current_tab and self.current_tab in self.frames:
+            self.frames[self.current_tab].grid_remove()
+
+        # Stack the new frame identically in the (0,0) slot
+        if tab_name in self.frames:
+            self.frames[tab_name].grid(row=0, column=0, sticky="nsew")
+            
+        self.current_tab = tab_name
+
+    # --- APP UPDATER LOGIC ---
+    def check_app_updates(self):
+        def worker():
+            try:
+                url = "https://api.github.com/repos/zmarotrix/OctoWoW-Installation-Manager/releases/latest"
+                req = urllib.request.Request(url, headers={'User-Agent': 'OctoWowApp'})
+                with urllib.request.urlopen(req, timeout=8) as resp:
+                    data = json.loads(resp.read().decode())
+                    latest_ver = data.get('tag_name', '').lstrip('v')
+                    current_ver = VERSION.lstrip('v')
+                    
+                    if latest_ver and latest_ver != current_ver:
+                        self.msg_queue.put(("app_update_available", data.get('html_url')))
+                    else:
+                        self.msg_queue.put(("app_update_none", None))
+            except Exception as e:
+                self.msg_queue.put(("app_update_error", str(e)))
+                
+        threading.Thread(target=worker, daemon=True).start()
 
     # --- SETTINGS TAB ---
-    def show_settings(self):
-        self.select_nav_btn("Settings")
-        self.hide_all_frames()
-        self.frames["Settings"].pack(fill="both", expand=True)
-
     def build_settings_tab(self):
-        frame = SmoothScrollableFrame(self.main_container, fg_color="transparent")
-        self.frames["Settings"] = frame
+        # Wrap scrollable area in a standard frame to prevent unmapping artifacts
+        tab_container = ctk.CTkFrame(self.main_container, fg_color=BG_COLOR, corner_radius=0)
+        self.frames["Settings"] = tab_container
+
+        frame = SmoothScrollableFrame(tab_container, fg_color=BG_COLOR)
+        frame.pack(fill="both", expand=True)
 
         ctk.CTkLabel(frame, text="Game Settings", font=("Segoe UI", 24, "bold"), text_color=TEXT_MAIN).pack(anchor="w", pady=(10, 20), padx=10)
 
@@ -467,6 +583,7 @@ class OctoWowApp(ctk.CTk):
             self.wow_dir.set(os.path.normpath(d))
             self.save_all_state()
             self.trigger_addon_scan(show_loading=True)
+            self.scan_game_mods()
 
     # --- CLIENT BITTORRENT DOWNLOADER / UPDATER ---
     def install_new_client(self):
@@ -554,7 +671,6 @@ class OctoWowApp(ctk.CTk):
             
             proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, creationflags=subprocess.CREATE_NO_WINDOW)
             
-            # Custom non-blocking byte reader to catch BitTorrent '\r' overwrites
             buffer = ""
             while True:
                 char = proc.stdout.read(1)
@@ -564,9 +680,7 @@ class OctoWowApp(ctk.CTk):
                 if char in ('\r', '\n'):
                     line_clean = buffer.strip()
                     if line_clean:
-                        # Match progress fractions: e.g. 1.1GiB/11GiB(9%)
                         frac_match = re.search(r'([0-9.]+[KMGTP]?i?B|0B)/([0-9.]+[KMGTP]?i?B|0B)\((\d+)%\)', line_clean, re.IGNORECASE)
-                        
                         if frac_match:
                             dl_amt, total_amt, pct = frac_match.groups()
                             if "Checksum" in line_clean or "verify" in line_clean.lower():
@@ -584,7 +698,6 @@ class OctoWowApp(ctk.CTk):
 
                             if comp_match:
                                 fname = os.path.basename(comp_match.group(1).strip())
-                                # Ignore the internal notification that it fetched the .torrent file
                                 if fname and not fname.endswith('.torrent'):
                                     self.msg_queue.put(("client_dl_file", f"[✔️] Verified/Completed: {fname}"))
                             elif alloc_match:
@@ -607,17 +720,16 @@ class OctoWowApp(ctk.CTk):
         except Exception as e:
             self.msg_queue.put(("client_dl_error", str(e)))
 
-    # --- MODS TAB ---
-    def show_mods(self):
-        self.select_nav_btn("Mods")
-        self.hide_all_frames()
-        self.frames["Mods"].pack(fill="both", expand=True)
+    # --- CLIENT TWEAKS TAB ---
+    def build_tweaks_tab(self):
+        # Wrap scrollable area in a standard frame to prevent unmapping artifacts
+        tab_container = ctk.CTkFrame(self.main_container, fg_color=BG_COLOR, corner_radius=0)
+        self.frames["Tweaks"] = tab_container
 
-    def build_mods_tab(self):
-        frame = SmoothScrollableFrame(self.main_container, fg_color="transparent")
-        self.frames["Mods"] = frame
+        frame = SmoothScrollableFrame(tab_container, fg_color=BG_COLOR)
+        frame.pack(fill="both", expand=True)
 
-        ctk.CTkLabel(frame, text="Client Mods", font=("Segoe UI", 24, "bold"), text_color=TEXT_MAIN).pack(anchor="w", pady=(10, 5), padx=10)
+        ctk.CTkLabel(frame, text="Client Tweaks", font=("Segoe UI", 24, "bold"), text_color=TEXT_MAIN).pack(anchor="w", pady=(10, 5), padx=10)
         ctk.CTkLabel(frame, text="Toggle core engine modifications and utilities.", text_color=TEXT_MUTED).pack(anchor="w", padx=10, pady=(0, 20))
 
         split = ctk.CTkFrame(frame, fg_color="transparent")
@@ -631,9 +743,16 @@ class OctoWowApp(ctk.CTk):
         ctk.CTkLabel(left, text="Highly recommended for stability.", text_color=TEXT_MUTED, font=("Segoe UI", 11)).pack(anchor="w", padx=15, pady=(0, 10))
         
         for dll, var in self.core_plugins.items():
-            sw = ctk.CTkSwitch(left, text=dll, variable=var, progress_color=SUCCESS_COLOR)
-            sw.pack(anchor="w", padx=20, pady=8)
+            row = ctk.CTkFrame(left, fg_color="transparent")
+            row.pack(fill="x", padx=20, pady=8)
+            
+            sw = ctk.CTkSwitch(row, text=dll, variable=var, text_color=TEXT_MAIN, progress_color=SUCCESS_COLOR)
+            sw.pack(side="left")
             CTkToolTip(sw, self.descriptions.get(dll, ""))
+            
+            if dll in self.GITHUB_MODS:
+                opt = ctk.CTkOptionMenu(row, values=["Recommended", "Latest (GitHub)"], variable=self.plugin_sources[dll], text_color=TEXT_MAIN, width=135, height=24, font=("Segoe UI", 11))
+                opt.pack(side="right")
 
         right = ctk.CTkFrame(split, fg_color=SURFACE_COLOR, corner_radius=8)
         right.grid(row=0, column=1, sticky="nsew", padx=10, pady=10)
@@ -641,18 +760,284 @@ class OctoWowApp(ctk.CTk):
         ctk.CTkLabel(right, text="Additional quality-of-life plugins.", text_color=TEXT_MUTED, font=("Segoe UI", 11)).pack(anchor="w", padx=15, pady=(0, 10))
         
         for dll, var in self.optional_plugins.items():
-            sw = ctk.CTkSwitch(right, text=dll, variable=var, progress_color=ACCENT_COLOR)
-            sw.pack(anchor="w", padx=20, pady=8)
+            row = ctk.CTkFrame(right, fg_color="transparent")
+            row.pack(fill="x", padx=20, pady=8)
+            
+            sw = ctk.CTkSwitch(row, text=dll, variable=var, text_color=TEXT_MAIN, progress_color=ACCENT_COLOR)
+            sw.pack(side="left")
             CTkToolTip(sw, self.descriptions.get(dll, ""))
 
-    # --- ADDON MANAGER TAB ---
-    def show_addons(self):
-        self.select_nav_btn("Addons")
-        self.hide_all_frames()
-        self.frames["Addons"].pack(fill="both", expand=True)
+        # --- COMPACT CREDITS SECTION ---
+        credits_card = self.create_card(frame, "📜 Open-Source Credits & Sources")
+        credits_card.pack(fill="x", padx=10, pady=(10, 20))
+        
+        ctk.CTkLabel(credits_card, text="This modernization tool packages the incredible work of several open-source developers.", text_color=TEXT_MUTED, font=("Segoe UI", 12)).pack(anchor="w", padx=15, pady=(0, 5))
+        
+        grid_frame = ctk.CTkFrame(credits_card, fg_color="transparent")
+        grid_frame.pack(fill="x", padx=10, pady=5)
+        
+        # Format: (Name, Mod URL, Addon URL)
+        credits = [
+            ("VanillaFixes", "https://github.com/hannesmann/vanillafixes", None),
+            ("VanillaHelpers", "https://github.com/isfir/VanillaHelpers", None),
+            ("PerfBoost", "https://gitea.com/avitasia/perf_boost", "https://gitea.com/avitasia/PerfBoostSettings"),
+            ("UnitXP_SP3", "https://codeberg.org/konaka/UnitXP_SP3", "https://codeberg.org/konaka/UnitXP_SP3_Addon"),
+            ("Nampower", "https://gitea.com/avitasia/nampower", "https://gitea.com/avitasia/NampowerSettings"),
+            ("SuperWoW", "https://github.com/balakethelock/SuperWoW", "https://github.com/balakethelock/SuperAPI"),
+            ("ClassicAPI", "https://github.com/brues-code/ClassicAPI", None),
+            ("Vanilla-Autologin", "https://github.com/MarcelineVQ/turtle-autologin", None),
+            ("WeirdUtils Suite", "https://codeberg.org/MarcelineVQ/WeirdUtils", None),
+            ("no1600x1200", None, None)
+        ]
+        
+        for i, (name, mod_url, addon_url) in enumerate(credits):
+            r, c = divmod(i, 3)
+            grid_frame.grid_columnconfigure(c, weight=1)
+            
+            c_frame = ctk.CTkFrame(grid_frame, fg_color=BG_COLOR, corner_radius=6)
+            c_frame.grid(row=r, column=c, sticky="nsew", padx=5, pady=5)
+            
+            ctk.CTkLabel(c_frame, text=name, font=("Segoe UI", 13, "bold"), text_color=TEXT_MAIN).pack(anchor="w", padx=10, pady=(8, 2))
+            
+            btn_row = ctk.CTkFrame(c_frame, fg_color="transparent")
+            btn_row.pack(anchor="w", fill="x", padx=10, pady=(0, 8))
+            
+            if mod_url:
+                ctk.CTkButton(btn_row, text="Mod ↗", font=("Segoe UI", 10, "bold"), width=50, height=22, 
+                              fg_color=CARD_COLOR, hover_color="#2A2E3F", text_color=ACCENT_COLOR,
+                              command=lambda u=mod_url: webbrowser.open(u)).pack(side="left", padx=(0, 5))
+            if addon_url:
+                ctk.CTkButton(btn_row, text="Addon ↗", font=("Segoe UI", 10, "bold"), width=50, height=22, 
+                              fg_color=CARD_COLOR, hover_color="#2A2E3F", text_color=SUCCESS_COLOR,
+                              command=lambda u=addon_url: webbrowser.open(u)).pack(side="left")
+            if not mod_url and not addon_url:
+                ctk.CTkLabel(btn_row, text="Legacy Engine File", font=("Segoe UI", 10, "italic"), text_color=TEXT_MUTED).pack(side="left")
 
+    # --- GAME MODS TAB (MPQ MANAGER) ---
+    def build_game_mods_tab(self):
+        frame = ctk.CTkFrame(self.main_container, fg_color=BG_COLOR)
+        self.frames["GameMods"] = frame
+
+        top = ctk.CTkFrame(frame, fg_color="transparent")
+        top.pack(fill="x", padx=10, pady=(10, 15))
+        
+        ctk.CTkLabel(top, text="Game Mods", font=("Segoe UI", 24, "bold"), text_color=TEXT_MAIN).pack(side="left")
+        ctk.CTkButton(top, text="➕ Add Mod (MPQ/ZIP)", fg_color=ACCENT_COLOR, hover_color=ACCENT_HOVER, font=("Segoe UI", 12, "bold"), command=self.add_game_mod).pack(side="right")
+        
+        sub_text = "Manage custom MPQ modifications. Drag and drop .mpq or .zip files anywhere to install." if HAS_DND else "Manage custom MPQ modifications. (Install tkinterdnd2 for Drag & Drop support)."
+        ctk.CTkLabel(frame, text=sub_text, text_color=TEXT_MUTED).pack(anchor="w", padx=10, pady=(0, 15))
+
+        self.game_mods_scroll = SmoothScrollableFrame(frame, fg_color="transparent")
+        self.game_mods_scroll.pack(fill="both", expand=True, padx=5)
+        
+        self.scan_game_mods()
+
+    def scan_game_mods(self):
+        wow_dir = self.wow_dir.get().strip()
+        data_dir = os.path.join(wow_dir, "Data")
+        
+        for widget in self.game_mods_scroll.winfo_children(): widget.destroy()
+        
+        if not wow_dir or not os.path.exists(data_dir):
+            lbl = ctk.CTkLabel(self.game_mods_scroll, text="Please set a valid WoW directory in Game Settings to manage MPQs.", text_color=TEXT_MUTED)
+            lbl.pack(pady=40)
+            return
+            
+        custom_mpqs = []
+        for f in os.listdir(data_dir):
+            low = f.lower()
+            if low in BASE_MPQ_BLACKLIST: continue
+            
+            if low.endswith('.mpq') or low.endswith('.mpq.disabled'):
+                base_name = f if low.endswith('.mpq') else f[:-9] # strip .disabled
+                is_enabled = low.endswith('.mpq')
+                custom_mpqs.append((base_name, f, is_enabled))
+                
+        if not custom_mpqs:
+            lbl = ctk.CTkLabel(self.game_mods_scroll, text="No custom Game Mods found in your Data folder.", text_color=TEXT_MUTED)
+            lbl.pack(pady=40)
+            return
+
+        for base_name, actual_name, is_enabled in sorted(custom_mpqs, key=lambda x: x[0].lower()):
+            self.create_game_mod_card(base_name, actual_name, is_enabled)
+
+    def create_game_mod_card(self, base_name, actual_name, is_enabled):
+        meta = self.game_mods_meta.get(base_name, {})
+        title = meta.get("title", base_name)
+        desc = meta.get("desc", "No description provided.")
+
+        card = ctk.CTkFrame(self.game_mods_scroll, fg_color=SURFACE_COLOR, corner_radius=8)
+        card.pack(fill="x", padx=5, pady=6)
+        
+        info_frame = ctk.CTkFrame(card, fg_color="transparent")
+        info_frame.pack(side="left", fill="both", expand=True, padx=15, pady=12)
+        
+        title_lbl = ctk.CTkLabel(info_frame, text=title, font=("Segoe UI", 15, "bold"), text_color=TEXT_MAIN)
+        title_lbl.pack(anchor="w")
+        
+        ctk.CTkLabel(info_frame, text=f"File: {base_name}", font=("Segoe UI", 11), text_color=TEXT_MUTED).pack(anchor="w", pady=(0, 4))
+        ctk.CTkLabel(info_frame, text=desc, font=("Segoe UI", 12), text_color=TEXT_MAIN, wraplength=500, justify="left").pack(anchor="w")
+
+        btn_frame = ctk.CTkFrame(card, fg_color="transparent")
+        btn_frame.pack(side="right", padx=15, pady=15)
+        
+        var = ctk.BooleanVar(value=is_enabled)
+        
+        def on_toggle(*args, bn=base_name, an=actual_name, v=var):
+            target_name = bn if v.get() else bn + ".disabled"
+            if an != target_name:
+                wow_dir = self.wow_dir.get().strip()
+                old_path = os.path.join(wow_dir, "Data", an)
+                new_path = os.path.join(wow_dir, "Data", target_name)
+                try:
+                    os.rename(old_path, new_path)
+                    self.scan_game_mods() 
+                except Exception as e:
+                    messagebox.showerror("Rename Error", f"Could not toggle {bn}.\n{e}")
+                    v.set(not v.get())
+
+        sw = ctk.CTkSwitch(btn_frame, text="Enabled", variable=var, command=on_toggle, text_color=TEXT_MAIN, progress_color=SUCCESS_COLOR)
+        sw.pack(side="left", padx=(0, 15))
+        
+        btn_edit = ctk.CTkButton(btn_frame, text="✏️", font=("Segoe UI Emoji", 14), width=32, height=32, corner_radius=16, 
+                                 fg_color=CARD_COLOR, hover_color="#2A2E3F", command=lambda: self.prompt_mpq_meta(base_name, os.path.join(self.wow_dir.get(), "Data", actual_name), True))
+        btn_edit.pack(side="left", padx=(0, 10))
+        CTkToolTip(btn_edit, "Edit Details")
+
+        btn_del = ctk.CTkButton(btn_frame, text="🗑", font=("Segoe UI Emoji", 14), width=32, height=32, corner_radius=16, 
+                                fg_color=ERROR_COLOR, hover_color="#DC2626", command=lambda: self.delete_game_mod(base_name, actual_name))
+        btn_del.pack(side="left")
+        CTkToolTip(btn_del, "Delete MPQ File")
+
+    def delete_game_mod(self, base_name, actual_name):
+        if messagebox.askyesno("Confirm Delete", f"Are you sure you want to permanently delete {actual_name}?"):
+            path = os.path.join(self.wow_dir.get().strip(), "Data", actual_name)
+            try:
+                if os.path.exists(path): os.remove(path)
+                if base_name in self.game_mods_meta:
+                    del self.game_mods_meta[base_name]
+                    self.save_all_state()
+                self.scan_game_mods()
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to delete file:\n{e}")
+
+    def add_game_mod(self):
+        if not self.wow_dir.get().strip() or not os.path.exists(os.path.join(self.wow_dir.get(), "Data")):
+            messagebox.showerror("Error", "Please set a valid WoW directory in Game Settings first.")
+            return
+            
+        files = filedialog.askopenfilenames(title="Select Game Mod (MPQ or ZIP)", filetypes=[("Mod Files", "*.mpq *.zip"), ("All Files", "*.*")])
+        if files: self.handle_dropped_files(files)
+
+    def handle_file_drop(self, event):
+        files = self.tk.splitlist(event.data)
+        if files:
+            self.show_tab("GameMods")
+            self.handle_dropped_files(files)
+
+    def handle_dropped_files(self, files):
+        if not self.wow_dir.get().strip() or not os.path.exists(os.path.join(self.wow_dir.get(), "Data")):
+            messagebox.showerror("Error", "Please set a valid WoW directory in Game Settings first.")
+            return
+
+        def process_files():
+            for f in files:
+                low = f.lower()
+                if low.endswith(".zip"):
+                    try:
+                        os.makedirs(self.mpq_temp_dir, exist_ok=True)
+                        with zipfile.ZipFile(f, 'r') as z:
+                            for info in z.infolist():
+                                if info.filename.lower().endswith('.mpq'):
+                                    extracted = z.extract(info, self.mpq_temp_dir)
+                                    self.pending_mpqs.append((extracted, os.path.basename(extracted)))
+                    except Exception as e:
+                        print(f"Failed to unzip {f}: {e}")
+                elif low.endswith(".mpq"):
+                    self.pending_mpqs.append((f, os.path.basename(f)))
+            
+            self.msg_queue.put(("mpq_process_next", None))
+            
+        threading.Thread(target=process_files, daemon=True).start()
+
+    def prompt_mpq_meta(self, filename, filepath, is_editing=False):
+        top = ctk.CTkToplevel(self)
+        top.title("Edit Mod Details" if is_editing else "New Game Mod Detected")
+        top.geometry("450x380")
+        top.resizable(False, False)
+        top.attributes("-topmost", True)
+        
+        x = self.winfo_x() + (self.winfo_width() // 2) - 225
+        y = self.winfo_y() + (self.winfo_height() // 2) - 190
+        top.geometry(f"+{x}+{y}")
+        top.grab_set()
+
+        frame = ctk.CTkFrame(top, fg_color=BG_COLOR, corner_radius=0)
+        frame.pack(fill="both", expand=True)
+        
+        ctk.CTkLabel(frame, text="🎨 Mod Details", font=("Segoe UI", 20, "bold"), text_color=ACCENT_COLOR).pack(pady=(20, 5))
+        ctk.CTkLabel(frame, text=f"File: {filename}", font=("Segoe UI", 12), text_color=TEXT_MUTED).pack(pady=(0, 20))
+        
+        meta = self.game_mods_meta.get(filename, {})
+        
+        ctk.CTkLabel(frame, text="Title:", font=("Segoe UI", 12, "bold"), text_color=TEXT_MAIN).pack(anchor="w", padx=30)
+        title_var = ctk.StringVar(value=meta.get("title", filename.replace(".mpq", "").replace("-", " ").title()))
+        ctk.CTkEntry(frame, textvariable=title_var, width=390, fg_color=SURFACE_COLOR, border_color=CARD_COLOR).pack(padx=30, pady=(5, 15))
+
+        ctk.CTkLabel(frame, text="Description:", font=("Segoe UI", 12, "bold"), text_color=TEXT_MAIN).pack(anchor="w", padx=30)
+        desc_box = ctk.CTkTextbox(frame, width=390, height=80, fg_color=SURFACE_COLOR, border_color=CARD_COLOR, border_width=2)
+        desc_box.pack(padx=30, pady=(5, 20))
+        desc_box.insert("1.0", meta.get("desc", ""))
+        
+        btn_frame = ctk.CTkFrame(frame, fg_color="transparent")
+        btn_frame.pack(fill="x", padx=30, side="bottom", pady=20)
+        
+        def save():
+            self.game_mods_meta[filename] = {"title": title_var.get().strip(), "desc": desc_box.get("1.0", "end").strip()}
+            self.save_all_state()
+            
+            if not is_editing:
+                target_path = os.path.join(self.wow_dir.get().strip(), "Data", filename)
+                try:
+                    shutil.copy2(filepath, target_path)
+                    if self.mpq_temp_dir in filepath:
+                        os.remove(filepath)
+                except Exception as e:
+                    messagebox.showerror("Error", f"Could not copy {filename} to Data folder.\n{e}")
+                    
+            top.grab_release()
+            top.destroy()
+            self.scan_game_mods()
+            if not is_editing: self.process_next_pending_mpq()
+
+        def cancel():
+            if not is_editing and self.mpq_temp_dir in filepath and os.path.exists(filepath):
+                try: os.remove(filepath)
+                except: pass
+            top.grab_release()
+            top.destroy()
+            if not is_editing: self.process_next_pending_mpq()
+
+        skip_text = "Cancel" if is_editing else "Skip / Cancel"
+        ctk.CTkButton(btn_frame, text=skip_text, fg_color=CARD_COLOR, hover_color="#2A2E3F", command=cancel, width=100).pack(side="left")
+        ctk.CTkButton(btn_frame, text="Save Mod", fg_color=SUCCESS_COLOR, hover_color="#059669", font=("Segoe UI", 12, "bold"), command=save).pack(side="right")
+
+    def process_next_pending_mpq(self):
+        if not self.pending_mpqs:
+            if os.path.exists(self.mpq_temp_dir): shutil.rmtree(self.mpq_temp_dir, ignore_errors=True)
+            return
+            
+        filepath, filename = self.pending_mpqs.pop(0)
+        if filename.lower() in BASE_MPQ_BLACKLIST:
+            self.process_next_pending_mpq()
+            return
+            
+        self.prompt_mpq_meta(filename, filepath, is_editing=False)
+
+
+    # --- ADDON MANAGER TAB ---
     def build_addons_tab(self):
-        frame = ctk.CTkFrame(self.main_container, fg_color="transparent")
+        frame = ctk.CTkFrame(self.main_container, fg_color=BG_COLOR)
         self.frames["Addons"] = frame
 
         top = ctk.CTkFrame(frame, fg_color="transparent")
@@ -984,13 +1369,8 @@ class OctoWowApp(ctk.CTk):
             self.btn_upd_all.pack_forget()
 
     # --- GAME UPDATER TAB ---
-    def show_updater(self):
-        self.select_nav_btn("Updater")
-        self.hide_all_frames()
-        self.frames["Updater"].pack(fill="both", expand=True)
-
     def build_updater_tab(self):
-        frame = ctk.CTkFrame(self.main_container, fg_color="transparent")
+        frame = ctk.CTkFrame(self.main_container, fg_color=BG_COLOR)
         self.frames["Updater"] = frame
 
         center = ctk.CTkFrame(frame, fg_color="transparent")
@@ -1128,16 +1508,44 @@ class OctoWowApp(ctk.CTk):
         payload_weirdu = os.path.join(payload_base, "WeirdUtils")
         dlls_text_lines = ["dxvk"]
 
+        def download_github_dll(repo, dest):
+            try:
+                api_url = f"https://api.github.com/repos/{repo}/releases/latest"
+                req = urllib.request.Request(api_url, headers={'User-Agent': 'OctoWowApp'})
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    data = json.loads(resp.read().decode())
+                
+                dl_url = next((a['browser_download_url'] for a in data.get('assets', []) if a['name'].endswith('.dll')), None)
+                if dl_url:
+                    req = urllib.request.Request(dl_url, headers={'User-Agent': 'OctoWowApp'})
+                    with urllib.request.urlopen(req, timeout=15) as resp, open(dest, 'wb') as f:
+                        shutil.copyfileobj(resp, f)
+                    return True
+            except Exception as e:
+                print(f"Failed to download {repo} from GitHub: {e}")
+            return False
+
         for dll_name, var in self.core_plugins.items():
             if var.get():
                 source_dll = os.path.join(payload_base, dll_name)
-                if os.path.exists(source_dll): shutil.copy2(source_dll, target)
+                target_dll = os.path.join(target, dll_name)
+                
+                src_pref = self.plugin_sources.get(dll_name, ctk.StringVar(value="Recommended")).get()
+                dl_success = False
+                
+                if src_pref == "Latest (GitHub)" and dll_name in self.GITHUB_MODS:
+                    dl_success = download_github_dll(self.GITHUB_MODS[dll_name], target_dll)
+                    
+                if not dl_success and os.path.exists(source_dll): 
+                    shutil.copy2(source_dll, target_dll)
+                    
                 dlls_text_lines.append(dll_name) 
 
         for dll_name, var in self.optional_plugins.items():
             if var.get():
                 source_dll = os.path.join(payload_weirdu, dll_name)
-                if os.path.exists(source_dll): shutil.copy2(source_dll, target)
+                target_dll = os.path.join(target, dll_name)
+                if os.path.exists(source_dll): shutil.copy2(source_dll, target_dll)
                 dlls_text_lines.append(dll_name)
 
         with open(os.path.join(target, "dlls.txt"), "w") as f:
@@ -1272,6 +1680,8 @@ oLink.Save
                     if hasattr(self, 'sync_lbl'): self.sync_lbl.configure(text=data)
                 elif msg_type == "sync_complete":
                     self.trigger_addon_scan(show_loading=True)
+                elif msg_type == "mpq_process_next":
+                    self.process_next_pending_mpq()
                 elif msg_type == "client_dl_progress":
                     pct, txt = data
                     if self.client_dl_window and self.client_dl_window.winfo_exists():
@@ -1306,7 +1716,7 @@ oLink.Save
                         self.lbl_update_status.configure(text="Update complete.")
                         self.progress_update.set(1.0)
                         self.btn_check_update.configure(state="normal")
-                    self.trigger_addon_scan(show_loading=False)
+                    self.trigger_addon_scan(show_loading=True)
                 elif msg_type == "client_dl_error":
                     if self.client_dl_window and self.client_dl_window.winfo_exists():
                         self.client_dl_window.destroy()
@@ -1319,6 +1729,20 @@ oLink.Save
                     self.btn_check_update.configure(state=data)
                 elif msg_type == "updater_prompt":
                     self.prompt_download_update(data)
+                elif msg_type == "app_update_available":
+                    self.app_update_url = data
+                    self.app_update_btn.configure(
+                        text="⚠️ App Update Available!", 
+                        text_color="#ffffff",
+                        fg_color=WARNING_COLOR,
+                        hover_color="#D97706",
+                        state="normal", 
+                        command=lambda: webbrowser.open(self.app_update_url)
+                    )
+                elif msg_type == "app_update_none":
+                    self.app_update_btn.grid_forget() 
+                elif msg_type == "app_update_error":
+                    self.app_update_btn.grid_forget() 
         except queue.Empty: pass
         finally: self.after(100, self.process_queue)
 
