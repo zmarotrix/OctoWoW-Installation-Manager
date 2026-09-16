@@ -9,12 +9,14 @@ This tool provides a graphical interface to manage client settings, wraps `vanil
 ## Features
 * **Git Addon Manager:** Scans the `Interface/AddOns` folder, parses `.toc` metadata, and uses Git to track, clone, and update addons in place.
 * **Client Downloader:** Downloads and extracts the OctoWoW client `.zip` directly to the user's local disk.
-* **App Auto-Updater:** Checks GitHub releases to download and apply updates to the manager itself.
 * **Engine Tweaks & Mods:** Provides toggles for 1.12 modifications including *VanillaFixes*, *UnitXP_SP3*, and the *WeirdUtils* suite.
+* **BitTorrent Game Updater:** Integrates `aria2c` to hash-check existing files and download only the necessary delta-patches directly from the official OctoWoW torrent network. Includes a live activity terminal for tracking file allocation and verification.
+* **Client Downloader:** Allows users to download and extract the base OctoWoW client `.zip` directly to an empty directory on their local disk.
 
 ---
 <img width="1052" height="782" alt="image" src="https://github.com/user-attachments/assets/aa3bb253-94af-4463-85c0-dc2f981daf70" />
 <img width="1052" height="782" alt="image" src="https://github.com/user-attachments/assets/d76da00e-579e-4207-9057-70fe89210905" />
+
 
 
 ## For Players: How to Download
@@ -97,4 +99,3 @@ Once your payload folder is populated, open your terminal in the root directory 
 pyinstaller --noconsole --onefile --icon="PurpleWowLogo.ico" --hidden-import customtkinter --add-data "Payload;Payload" --add-data "vanilla-tweaks.exe;." --add-data "PurpleWowLogo.ico;." OctoWow_Install_Manager.py
 ```
 This will generate the standalone executable inside the `dist` folder.
-```
