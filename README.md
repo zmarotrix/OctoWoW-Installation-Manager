@@ -1,30 +1,29 @@
-# OctoWoW Install Manager
+# OctoWoW Installation Manager
 
 A configuration, modding, and addon management tool for the OctoWoW (Vanilla 1.12.1) client. 
 
-This tool provides a graphical interface to manage client settings, wraps `vanilla-tweaks.exe` for engine adjustments (such as Widescreen FoV and memory limits), deploys core `.dll` engine hooks (like SuperWoW and DXVK), and handles addon synchronization via Git.
+This tool provides a graphical interface to manage client settings, wraps `vanilla-tweaks.exe` for engine adjustments, deploys core `.dll` engine hooks, manages custom `.mpq` patches, and handles addon synchronization from GitHub or local archives.
 
 ---
 
 ## Features
-* **Git Addon Manager:** Scans the `Interface/AddOns` folder, parses `.toc` metadata, and uses Git to track, clone, and update addons in place.
-* **Client Downloader:** Downloads and extracts the OctoWoW client `.zip` directly to the user's local disk.
-* **Engine Tweaks & Mods:** Provides toggles for 1.12 modifications including *VanillaFixes*, *UnitXP_SP3*, and the *WeirdUtils* suite.
-* **BitTorrent Game Updater:** Integrates `aria2c` to hash-check existing files and download only the necessary delta-patches directly from the official OctoWoW torrent network. Includes a live activity terminal for tracking file allocation and verification.
-* **Client Downloader:** Allows users to download and extract the base OctoWoW client `.zip` directly to an empty directory on their local disk.
+* **Game Settings & Engine Adjustments:** Integrates `vanilla-tweaks.exe` to calculate aspect ratios and expand engine limits (FoV, render distance, ground clutter, and camera zoom). Automatically applies memory limit expansions (Large Address Aware), DEP mitigations, and interface corruption bypasses.
+* **Game Mods (MPQ Manager):** Automatically detects custom `.mpq` patches in the `Data` folder. Allows users to toggle mods on and off without deleting them, and edit custom titles/descriptions that save to the app's configuration.
+* **Smart Addon Manager:** Scans the `Interface/AddOns` folder and uses the GitHub API to track and download the latest source code. It automatically locates `.toc` metadata and formats the folder names correctly so they load in-game. Supports batch updating and installing from local `.zip` files.
+* **Client Tweaks & Custom DLLs:** Provides toggles for 1.12 modifications including *VanillaFixes*, *UnitXP_SP3*, and the *WeirdUtils* suite, with options to pull the latest versions directly from GitHub. Users can also import and toggle their own custom `.dll` hooks. The app safely manages `dlls.txt` to preserve all custom and unmanaged background DLLs.
+* **BitTorrent Game Updater:** Integrates an `aria2c` engine to hash-check existing files and download missing or updated data directly into the game folder. Includes a pre-scan step for clear console feedback on file integrity before downloading begins.
+* **Smart Drag & Drop:** Drop `.mpq`, `.dll`, or `.zip` files anywhere onto the application to instantly detect the file type, route it to the correct tab, and install it.
 
 ---
-<img width="1052" height="782" alt="image" src="https://github.com/user-attachments/assets/aa3bb253-94af-4463-85c0-dc2f981daf70" />
-<img width="1052" height="782" alt="image" src="https://github.com/user-attachments/assets/d76da00e-579e-4207-9057-70fe89210905" />
-
+<img width="1044" height="808" alt="image" src="https://github.com/user-attachments/assets/b9d74f18-e25a-483c-b25a-b5d3f7b2fed0" />
+<img width="1041" height="803" alt="image" src="https://github.com/user-attachments/assets/acc6686c-c4c9-4c99-9e06-905767673239" />
+<img width="1044" height="811" alt="image" src="https://github.com/user-attachments/assets/8c5978e2-2b69-45fd-bf7f-4e345e4bf2e1" />
 
 
 ## For Players: How to Download
 If you are looking to install the game, manage mods, or update your addons, **you do not need to build this from source.**
 
 Go to the **[Releases](../../releases)** tab on the right side of this GitHub page and download the latest `.exe` file. The release executable comes with the necessary DLLs, Addon Dependencies, and patchers pre-packaged inside it.
-
-*(Note: To use the Addon Manager functionality, you must have [Git for Windows](https://git-scm.com/download/win) installed on your system.)*
 
 ---
 
@@ -35,6 +34,7 @@ This repository contains **only the UI source code (`OctoWow_Install_Manager.py`
 1. Python 3.8+
 2. Install the required UI library: `pip install customtkinter`
 3. Install PyInstaller: `pip install pyinstaller`
+*(Note: standard library modules like `tkinter`, `urllib`, and `zipfile` are used for the rest of the application).*
 
 ### Dependency Sources
 *Disclaimer: The links below point to the original repositories. If a link becomes inactive, you will need to source the binary from community archives.*
