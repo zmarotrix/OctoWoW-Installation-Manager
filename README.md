@@ -6,6 +6,15 @@ This tool provides a graphical interface to manage client settings, wraps `vanil
 
 ---
 
+> **⚠️ Windows Defender / Antivirus Warning**  
+> You may receive a warning from Windows Defender or other antivirus software when downloading or running this application. This is a standard **false positive** caused by two things:
+> 1. **Executable Patching:** The app uses `vanilla-tweaks.exe` to modify the engine limits of your `WoW.exe` file (creating `WoW_Tweaked.exe`). Antivirus software heavily scrutinizes any program that patches other executables.
+> 2. **App Compilation:** This application is bundled into a single `.exe` using PyInstaller, which is frequently flagged by heuristic scanners.  
+> 
+> *If the application is blocked or deleted, you may need to add it or your WoW folder to your antivirus exclusions. All source code is publicly available in this repository for full transparency.*
+
+---
+
 ## Features
 * **Game Settings & Engine Adjustments:** Integrates `vanilla-tweaks.exe` to calculate aspect ratios and expand engine limits (FoV, render distance, ground clutter, and camera zoom). Automatically applies memory limit expansions (Large Address Aware), DEP mitigations, and interface corruption bypasses.
 * **Game Mods (MPQ Manager):** Automatically detects custom `.mpq` patches in the `Data` folder. Allows users to toggle mods on and off without deleting them, and edit custom titles/descriptions that save to the app's configuration.
