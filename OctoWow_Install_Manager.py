@@ -30,7 +30,7 @@ except ImportError:
 # --- CONFIGURATION ---
 CLIENT_ZIP_URL = "https://your-server.com/OctoWoW_Client.zip" # <-- CHANGE THIS TO YOUR ACTUAL CLIENT ZIP URL
 CONFIG_FILE = "octowow_config.json"
-VERSION = "2.5"
+VERSION = "2.5.2"
 
 # Standard Vanilla 1.12 MPQ files that should be ignored by the Game Mods manager
 BASE_MPQ_BLACKLIST = {
@@ -282,6 +282,46 @@ class AddonManager:
                 with open(meta_path, 'w') as f:
                     json.dump({"url": url, "sha": sha}, f)
 
+    @staticmethod
+    def install_local_addon(zip_path, addons_dir):
+        """Extracts a local ZIP file, locates .toc, and logically renames addon folders before moving."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with zipfile.ZipFile(zip_path, 'r') as z:
+                z.extractall(tmpdir)
+                
+            extracted_items = [item for item in os.listdir(tmpdir)]
+            if not extracted_items: raise Exception("ZIP file contained no contents")
+            
+            # Find the root containing the data
+            extracted_root = os.path.join(tmpdir, extracted_items[0])
+            if not os.path.isdir(extracted_root) or len(extracted_items) > 1:
+                extracted_root = tmpdir
+                
+            addon_dirs = []
+            
+            # 1. Search for .toc files directly in the root
+            tocs_in_root = [f for f in os.listdir(extracted_root) if f.endswith('.toc')]
+            if tocs_in_root:
+                addon_dirs.append((extracted_root, tocs_in_root[0][:-4]))
+            else:
+                # 2. Search deeper in immediate subdirectories (typical for addon-packs)
+                for item in os.listdir(extracted_root):
+                    subpath = os.path.join(extracted_root, item)
+                    if os.path.isdir(subpath):
+                        tocs = [f for f in os.listdir(subpath) if f.endswith('.toc')]
+                        if tocs:
+                            addon_dirs.append((subpath, tocs[0][:-4]))
+                            
+            if not addon_dirs:
+                raise Exception("No .toc (addon configuration files) found in this ZIP.")
+                
+            # Move the correct folders out and rename them to match the TOC
+            for src, name in addon_dirs:
+                dest = os.path.join(addons_dir, name)
+                if os.path.exists(dest):
+                    shutil.rmtree(dest, ignore_errors=True)
+                shutil.move(src, dest)
+
 # ==========================================
 # 3. VIEW & CONTROLLER: UI AND INSTALL LOGIC
 # ==========================================
@@ -368,6 +408,11 @@ class OctoWowApp(BaseApp):
         for dll in ["bigcursor.dll", "customassets.dll", "logsessions.dll", "minimapicons.dll", "pngscreenshots.dll", "worldmarkers.dll"]:
             self.optional_plugins[dll] = ctk.BooleanVar(value=self.config.get('optional_plugins', {}).get(dll, False))
 
+        self.custom_plugins_config = self.config.get('custom_plugins', {})
+        self.custom_plugins = {}
+        for dll, state in self.custom_plugins_config.items():
+            self.custom_plugins[dll] = ctk.BooleanVar(value=state)
+
         self.addon_dependencies = {"nampower.dll": "nampowersettings", "perf_boost.dll": "perfboostsettings", "UnitXP_SP3.dll": "UnitXP_SP3_Addon", "SuperWoWhook.dll": "SuperAPI"}
 
         self.GITHUB_MODS = {
@@ -430,7 +475,7 @@ class OctoWowApp(BaseApp):
         for v in all_vars:
             v.trace_add("write", self.save_all_state)
             
-        for d in (self.core_plugins, self.optional_plugins, self.plugin_sources):
+        for d in (self.core_plugins, self.optional_plugins, self.custom_plugins, self.plugin_sources):
             for v in d.values():
                 v.trace_add("write", self.save_all_state)
 
@@ -466,6 +511,7 @@ class OctoWowApp(BaseApp):
         self.config.set('install_autologin', self.install_autologin.get())
         self.config.set('core_plugins', {k: v.get() for k, v in self.core_plugins.items()})
         self.config.set('optional_plugins', {k: v.get() for k, v in self.optional_plugins.items()})
+        self.config.set('custom_plugins', {k: v.get() for k, v in self.custom_plugins.items()})
         self.config.set('plugin_sources', {k: v.get() for k, v in self.plugin_sources.items()})
         self.config.set('tracked_addons', self.tracked_addons)
         self.config.set('game_mods_meta', self.game_mods_meta)
@@ -555,6 +601,47 @@ class OctoWowApp(BaseApp):
             self.frames[tab_name].grid(row=0, column=0, sticky="nsew")
             
         self.current_tab = tab_name
+
+    def check_app_updates(self):
+        def worker():
+            try:
+                url = "https://api.github.com/repos/zmarotrix/OctoWoW-Installation-Manager/releases/latest"
+                req = urllib.request.Request(url, headers={'User-Agent': 'OctoWowApp'})
+                with urllib.request.urlopen(req, timeout=8) as resp:
+                    data = json.loads(resp.read().decode())
+                    latest_ver = data.get('tag_name', '').lstrip('v')
+                    current_ver = VERSION.lstrip('v')
+                    
+                    if latest_ver and latest_ver != current_ver:
+                        assets = data.get('assets', [])
+                        dl_url = None
+                        asset_name = None
+                        
+                        # Look for an .exe first, fallback to .zip
+                        for a in assets:
+                            if a['name'].endswith('.exe'):
+                                dl_url = a['browser_download_url']
+                                asset_name = a['name']
+                                break
+                        if not dl_url:
+                            for a in assets:
+                                if a['name'].endswith('.zip'):
+                                    dl_url = a['browser_download_url']
+                                    asset_name = a['name']
+                                    break
+                        
+                        if dl_url:
+                            self.msg_queue.put(("app_update_available", (dl_url, asset_name)))
+                        else:
+                            # Fallback to opening the browser if no downloads are found
+                            self.msg_queue.put(("app_update_browser", data.get('html_url')))
+                    else:
+                        self.msg_queue.put(("app_update_none", None))
+            except Exception as e:
+                self.msg_queue.put(("app_update_error", str(e)))
+                
+        threading.Thread(target=worker, daemon=True).start()
+        
 
     def check_app_updates(self):
         def worker():
@@ -886,9 +973,20 @@ class OctoWowApp(BaseApp):
             sw.pack(side="left")
             CTkToolTip(sw, self.descriptions.get(dll, ""))
 
-        credits_card = self.create_card(frame, "📜 Open-Source Credits & Sources")
-        credits_card.pack(fill="x", padx=10, pady=(10, 20))
+        # --- CUSTOM USER PLUGINS SECTION ---
+        custom_inner = self.create_card(frame, "🔧 Custom User Plugins")
         
+        top_custom = ctk.CTkFrame(custom_inner, fg_color="transparent")
+        top_custom.pack(fill="x", pady=(0, 10))
+        ctk.CTkLabel(top_custom, text="Manage your own third-party DLLs. They will automatically be added/removed from your dlls.txt file.", text_color=TEXT_MUTED, font=("Segoe UI", 11)).pack(side="left")
+        ctk.CTkButton(top_custom, text="➕ Add Custom DLL", height=24, font=("Segoe UI", 11, "bold"), fg_color=CARD_COLOR, hover_color="#2A2E3F", command=self.add_custom_dll).pack(side="right")
+        
+        self.custom_plugins_list_frame = ctk.CTkFrame(custom_inner, fg_color="transparent")
+        self.custom_plugins_list_frame.pack(fill="both", expand=True)
+        self.refresh_custom_dlls_ui()
+
+        # --- CREDITS SECTION ---
+        credits_card = self.create_card(frame, "📜 Open-Source Credits & Sources")
         ctk.CTkLabel(credits_card, text="This modernization tool packages the incredible work of several open-source developers.", text_color=TEXT_MUTED, font=("Segoe UI", 12)).pack(anchor="w", padx=15, pady=(0, 5))
         
         grid_frame = ctk.CTkFrame(credits_card, fg_color="transparent")
@@ -929,6 +1027,77 @@ class OctoWowApp(BaseApp):
                               command=lambda u=addon_url: webbrowser.open(u)).pack(side="left")
             if not mod_url and not addon_url:
                 ctk.CTkLabel(btn_row, text="Legacy Engine File", font=("Segoe UI", 10, "italic"), text_color=TEXT_MUTED).pack(side="left")
+
+
+    def refresh_custom_dlls_ui(self):
+        for w in self.custom_plugins_list_frame.winfo_children(): w.destroy()
+        
+        if not self.custom_plugins:
+            lbl = ctk.CTkLabel(self.custom_plugins_list_frame, text="No custom DLLs managed. Click 'Add Custom DLL' to import one.", text_color=TEXT_MUTED, font=("Segoe UI", 11, "italic"))
+            lbl.pack(pady=10)
+            return
+            
+        for dll, var in self.custom_plugins.items():
+            row = ctk.CTkFrame(self.custom_plugins_list_frame, fg_color=BG_COLOR, corner_radius=6)
+            row.pack(fill="x", pady=4, padx=5)
+            
+            sw = ctk.CTkSwitch(row, text=dll, variable=var, text_color=TEXT_MAIN, progress_color=INFO_COLOR, font=("Segoe UI", 12, "bold"))
+            sw.pack(side="left", padx=15, pady=10)
+            
+            btn_del = ctk.CTkButton(row, text="🗑", font=("Segoe UI Emoji", 14), width=32, height=32, corner_radius=16, fg_color=ERROR_COLOR, hover_color="#DC2626", command=lambda d=dll: self.remove_custom_dll(d))
+            btn_del.pack(side="right", padx=10, pady=5)
+            CTkToolTip(btn_del, "Permanently Remove DLL")
+
+    def add_custom_dll(self):
+        wow_dir = self.wow_dir.get().strip()
+        if not wow_dir or not os.path.exists(os.path.join(wow_dir, "WoW.exe")):
+            messagebox.showerror("Error", "Please set a valid WoW directory in Game Settings first.")
+            return
+        
+        filepath = filedialog.askopenfilename(title="Select Custom DLL", filetypes=[("DLL Files", "*.dll")])
+        if not filepath: return
+        
+        filename = os.path.basename(filepath)
+        
+        # Check if the DLL belongs to our standard core/optional plugins
+        managed_defaults = list(self.core_plugins.keys()) + list(self.optional_plugins.keys())
+        if filename.lower() in [m.lower() for m in managed_defaults]:
+            messagebox.showerror("Error", "This DLL is already managed natively by the app.")
+            return
+            
+        if filename in self.custom_plugins:
+            messagebox.showinfo("Info", "This DLL is already in your custom plugins list.")
+            return
+            
+        target_path = os.path.join(wow_dir, filename)
+        
+        # Only copy if they didn't just select the file that is ALREADY in the WoW directory
+        if os.path.normpath(filepath).lower() != os.path.normpath(target_path).lower():
+            try:
+                shutil.copy2(filepath, target_path)
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to copy DLL to WoW folder:\n{e}")
+                return
+                
+        var = ctk.BooleanVar(value=True)
+        var.trace_add("write", self.save_all_state)
+        self.custom_plugins[filename] = var
+        self.save_all_state()
+        self.refresh_custom_dlls_ui()
+
+    def remove_custom_dll(self, dll_name):
+        if messagebox.askyesno("Remove Custom DLL", f"Are you sure you want to completely remove '{dll_name}'?\n\nThis will delete the file from your game folder and remove it from the manager."):
+            del self.custom_plugins[dll_name]
+            self.save_all_state()
+            
+            wow_dir = self.wow_dir.get().strip()
+            if wow_dir:
+                target_path = os.path.join(wow_dir, dll_name)
+                if os.path.exists(target_path):
+                    try: os.remove(target_path)
+                    except: pass
+            
+            self.refresh_custom_dlls_ui()
 
     # --- GAME MODS TAB (MPQ MANAGER) ---
     def build_game_mods_tab(self):
@@ -1048,34 +1217,114 @@ class OctoWowApp(BaseApp):
 
     def handle_file_drop(self, event):
         files = self.tk.splitlist(event.data)
-        if files:
-            self.show_tab("GameMods")
-            self.handle_dropped_files(files)
+        if not files: return
+        
+        wow_dir = self.wow_dir.get().strip()
+        if not wow_dir or not os.path.exists(os.path.join(wow_dir, "WoW.exe")):
+            messagebox.showerror("Error", "Please set a valid WoW directory in Game Settings first.")
+            return
 
-    def handle_dropped_files(self, files):
+        mpqs, dlls, zips = [], [], []
+        for f in files:
+            low = f.lower()
+            if low.endswith(".mpq"): mpqs.append(f)
+            elif low.endswith(".dll"): dlls.append(f)
+            elif low.endswith(".zip"): zips.append(f)
+
+        if mpqs:
+            self.show_tab("GameMods")
+            self.handle_dropped_mpqs(mpqs)
+        if dlls:
+            self.show_tab("Tweaks")
+            for dll in dlls:
+                self.install_custom_dll(dll)
+        if zips:
+            self.show_tab("Addons")
+            self.install_dropped_addons(zips)
+
+    def handle_dropped_mpqs(self, files):
         if not self.wow_dir.get().strip() or not os.path.exists(os.path.join(self.wow_dir.get(), "Data")):
             messagebox.showerror("Error", "Please set a valid WoW directory in Game Settings first.")
             return
 
         def process_files():
             for f in files:
-                low = f.lower()
-                if low.endswith(".zip"):
-                    try:
-                        os.makedirs(self.mpq_temp_dir, exist_ok=True)
-                        with zipfile.ZipFile(f, 'r') as z:
-                            for info in z.infolist():
-                                if info.filename.lower().endswith('.mpq'):
-                                    extracted = z.extract(info, self.mpq_temp_dir)
-                                    self.pending_mpqs.append((extracted, os.path.basename(extracted)))
-                    except Exception as e:
-                        print(f"Failed to unzip {f}: {e}")
-                elif low.endswith(".mpq"):
+                if f.lower().endswith(".mpq"):
                     self.pending_mpqs.append((f, os.path.basename(f)))
-            
             self.msg_queue.put(("mpq_process_next", None))
             
         threading.Thread(target=process_files, daemon=True).start()
+
+
+    def add_game_mod(self):
+        if not self.wow_dir.get().strip() or not os.path.exists(os.path.join(self.wow_dir.get(), "Data")):
+            messagebox.showerror("Error", "Please set a valid WoW directory in Game Settings first.")
+            return
+            
+        files = filedialog.askopenfilenames(title="Select Game Mod (MPQ)", filetypes=[("MPQ Files", "*.mpq"), ("All Files", "*.*")])
+        if files: self.handle_dropped_mpqs(files)
+
+    def add_custom_dll(self):
+        wow_dir = self.wow_dir.get().strip()
+        if not wow_dir or not os.path.exists(os.path.join(wow_dir, "WoW.exe")):
+            messagebox.showerror("Error", "Please set a valid WoW directory in Game Settings first.")
+            return
+        
+        filepath = filedialog.askopenfilename(title="Select Custom DLL", filetypes=[("DLL Files", "*.dll")])
+        if filepath:
+            self.install_custom_dll(filepath)
+
+    def install_custom_dll(self, filepath):
+        wow_dir = self.wow_dir.get().strip()
+        filename = os.path.basename(filepath)
+        
+        managed_defaults = list(self.core_plugins.keys()) + list(self.optional_plugins.keys())
+        if filename.lower() in [m.lower() for m in managed_defaults]:
+            messagebox.showerror("Error", f"'{filename}' is already managed natively by the app.")
+            return
+            
+        if filename in self.custom_plugins:
+            messagebox.showinfo("Info", f"'{filename}' is already in your custom plugins list.")
+            return
+            
+        target_path = os.path.join(wow_dir, filename)
+        
+        if os.path.normpath(filepath).lower() != os.path.normpath(target_path).lower():
+            try:
+                shutil.copy2(filepath, target_path)
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to copy DLL to WoW folder:\n{e}")
+                return
+                
+        var = ctk.BooleanVar(value=True)
+        var.trace_add("write", self.save_all_state)
+        self.custom_plugins[filename] = var
+        self.save_all_state()
+        self.refresh_custom_dlls_ui()
+
+    def install_dropped_addons(self, zips):
+        wow_dir = self.wow_dir.get().strip()
+        addons_dir = os.path.join(wow_dir, "Interface", "AddOns")
+        
+        def worker():
+            for zip_path in zips:
+                try:
+                    AddonManager.install_local_addon(zip_path, addons_dir)
+                except Exception as e:
+                    self.msg_queue.put(("app_update_fail", f"Failed to format and install addon from ZIP ({os.path.basename(zip_path)}):\n{e}"))
+            
+            self.msg_queue.put(("trigger_addon_scan", None))
+            
+        self.is_scanning_addons = True
+        
+        for widget in self.addon_scroll.winfo_children(): widget.destroy()
+        load_frame = ctk.CTkFrame(self.addon_scroll, fg_color="transparent")
+        load_frame.pack(expand=True, pady=40)
+        ctk.CTkLabel(load_frame, text="⏳", font=("Segoe UI", 36)).pack(pady=(0,10))
+        ctk.CTkLabel(load_frame, text="Extracting and Installing Addons...", font=("Segoe UI", 16, "bold"), text_color=ACCENT_COLOR).pack()
+        
+        threading.Thread(target=worker, daemon=True).start()
+
 
     def prompt_mpq_meta(self, filename, filepath, is_editing=False):
         top = ctk.CTkToplevel(self)
@@ -1638,6 +1887,30 @@ class OctoWowApp(BaseApp):
     def configure_plugins(self, target):
         payload_base = os.path.join(get_base_path(), "Payload")
         payload_weirdu = os.path.join(payload_base, "WeirdUtils")
+        dlls_txt_path = os.path.join(target, "dlls.txt")
+        
+        # 1. Define all the DLLs that this app explicitly manages
+        managed_dlls = {"dxvk"}
+        managed_dlls.update(self.core_plugins.keys())
+        managed_dlls.update(self.optional_plugins.keys())
+        managed_dlls.update(self.custom_plugins.keys())
+        managed_dlls_lower = {m.lower() for m in managed_dlls}
+        
+        # 2. Read the existing dlls.txt to find user-added custom DLLs
+        custom_dlls = []
+        if os.path.exists(dlls_txt_path):
+            try:
+                with open(dlls_txt_path, "r") as f:
+                    for line in f:
+                        clean_line = line.strip()
+                        # If it's not empty and not in our managed list, it's a completely unmanaged background DLL
+                        if clean_line and clean_line.lower() not in managed_dlls_lower:
+                            if clean_line not in custom_dlls:
+                                custom_dlls.append(clean_line)
+            except Exception as e:
+                print(f"Error reading existing dlls.txt: {e}")
+
+        # 3. Start building the new file content with our required base
         dlls_text_lines = ["dxvk"]
 
         def download_github_dll(repo, dest):
@@ -1657,6 +1930,7 @@ class OctoWowApp(BaseApp):
                 print(f"Failed to download {repo} from GitHub: {e}")
             return False
 
+        # Add enabled core plugins
         for dll_name, var in self.core_plugins.items():
             if var.get():
                 source_dll = os.path.join(payload_base, dll_name)
@@ -1673,6 +1947,7 @@ class OctoWowApp(BaseApp):
                     
                 dlls_text_lines.append(dll_name) 
 
+        # Add enabled optional plugins
         for dll_name, var in self.optional_plugins.items():
             if var.get():
                 source_dll = os.path.join(payload_weirdu, dll_name)
@@ -1680,8 +1955,73 @@ class OctoWowApp(BaseApp):
                 if os.path.exists(source_dll): shutil.copy2(source_dll, target_dll)
                 dlls_text_lines.append(dll_name)
 
-        with open(os.path.join(target, "dlls.txt"), "w") as f:
-            f.write("\n".join(dlls_text_lines))
+        # Add enabled custom plugins (verifying they actually still exist on the drive)
+        for dll_name, var in self.custom_plugins.items():
+            if var.get():
+                if os.path.exists(os.path.join(target, dll_name)):
+                    dlls_text_lines.append(dll_name)
+                
+        # 4. Append the completely unmanaged background DLLs back to the list
+        dlls_text_lines.extend(custom_dlls)
+
+        # 5. Save the final list
+        try:
+            with open(dlls_txt_path, "w") as f:
+                f.write("\n".join(dlls_text_lines))
+        except Exception as e:
+            print(f"Failed to write to dlls.txt: {e}")
+
+        def download_github_dll(repo, dest):
+            try:
+                api_url = f"https://api.github.com/repos/{repo}/releases/latest"
+                req = urllib.request.Request(api_url, headers={'User-Agent': 'OctoWowApp'})
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    data = json.loads(resp.read().decode())
+                
+                dl_url = next((a['browser_download_url'] for a in data.get('assets', []) if a['name'].endswith('.dll')), None)
+                if dl_url:
+                    req = urllib.request.Request(dl_url, headers={'User-Agent': 'OctoWowApp'})
+                    with urllib.request.urlopen(req, timeout=15) as resp, open(dest, 'wb') as f:
+                        shutil.copyfileobj(resp, f)
+                    return True
+            except Exception as e:
+                print(f"Failed to download {repo} from GitHub: {e}")
+            return False
+
+        # Add enabled core plugins
+        for dll_name, var in self.core_plugins.items():
+            if var.get():
+                source_dll = os.path.join(payload_base, dll_name)
+                target_dll = os.path.join(target, dll_name)
+                
+                src_pref = self.plugin_sources.get(dll_name, ctk.StringVar(value="Recommended")).get()
+                dl_success = False
+                
+                if src_pref == "Latest (GitHub)" and dll_name in self.GITHUB_MODS:
+                    dl_success = download_github_dll(self.GITHUB_MODS[dll_name], target_dll)
+                    
+                if not dl_success and os.path.exists(source_dll): 
+                    shutil.copy2(source_dll, target_dll)
+                    
+                dlls_text_lines.append(dll_name) 
+
+        # Add enabled optional plugins
+        for dll_name, var in self.optional_plugins.items():
+            if var.get():
+                source_dll = os.path.join(payload_weirdu, dll_name)
+                target_dll = os.path.join(target, dll_name)
+                if os.path.exists(source_dll): shutil.copy2(source_dll, target_dll)
+                dlls_text_lines.append(dll_name)
+                
+        # 4. Append the user's custom DLLs back to the list
+        dlls_text_lines.extend(custom_dlls)
+
+        # 5. Save the final list
+        try:
+            with open(dlls_txt_path, "w") as f:
+                f.write("\n".join(dlls_text_lines))
+        except Exception as e:
+            print(f"Failed to write to dlls.txt: {e}")
 
     def run_vanilla_tweaks(self, target):
         wow_exe = os.path.join(target, "WoW.exe")
@@ -1861,7 +2201,13 @@ oLink.Save
                 elif msg_type == "app_update_none":
                     self.app_update_btn.grid_forget() 
                 elif msg_type == "app_update_error":
+                    self.app_update_btn.grid_forget()
+                elif msg_type == "app_update_none":
                     self.app_update_btn.grid_forget() 
+                elif msg_type == "app_update_error":
+                    self.app_update_btn.grid_forget()
+                elif msg_type == "trigger_addon_scan":
+                    self.trigger_addon_scan(show_loading=True)
         except queue.Empty: pass
         finally: self.after(100, self.process_queue)
 

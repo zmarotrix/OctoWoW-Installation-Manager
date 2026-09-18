@@ -13,3 +13,4 @@ dist/
 # Ignore Python cache
 __pycache__/
 *.pyc
+test/
