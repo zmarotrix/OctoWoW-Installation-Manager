@@ -30,7 +30,7 @@ except ImportError:
 # --- CONFIGURATION ---
 CLIENT_ZIP_URL = "https://your-server.com/OctoWoW_Client.zip" # <-- CHANGE THIS TO YOUR ACTUAL CLIENT ZIP URL
 CONFIG_FILE = "octowow_config.json"
-VERSION = "2.5.2"
+VERSION = "2.5.3"
 
 # Standard Vanilla 1.12 MPQ files that should be ignored by the Game Mods manager
 BASE_MPQ_BLACKLIST = {
@@ -601,48 +601,7 @@ class OctoWowApp(BaseApp):
             self.frames[tab_name].grid(row=0, column=0, sticky="nsew")
             
         self.current_tab = tab_name
-
-    def check_app_updates(self):
-        def worker():
-            try:
-                url = "https://api.github.com/repos/zmarotrix/OctoWoW-Installation-Manager/releases/latest"
-                req = urllib.request.Request(url, headers={'User-Agent': 'OctoWowApp'})
-                with urllib.request.urlopen(req, timeout=8) as resp:
-                    data = json.loads(resp.read().decode())
-                    latest_ver = data.get('tag_name', '').lstrip('v')
-                    current_ver = VERSION.lstrip('v')
-                    
-                    if latest_ver and latest_ver != current_ver:
-                        assets = data.get('assets', [])
-                        dl_url = None
-                        asset_name = None
-                        
-                        # Look for an .exe first, fallback to .zip
-                        for a in assets:
-                            if a['name'].endswith('.exe'):
-                                dl_url = a['browser_download_url']
-                                asset_name = a['name']
-                                break
-                        if not dl_url:
-                            for a in assets:
-                                if a['name'].endswith('.zip'):
-                                    dl_url = a['browser_download_url']
-                                    asset_name = a['name']
-                                    break
-                        
-                        if dl_url:
-                            self.msg_queue.put(("app_update_available", (dl_url, asset_name)))
-                        else:
-                            # Fallback to opening the browser if no downloads are found
-                            self.msg_queue.put(("app_update_browser", data.get('html_url')))
-                    else:
-                        self.msg_queue.put(("app_update_none", None))
-            except Exception as e:
-                self.msg_queue.put(("app_update_error", str(e)))
-                
-        threading.Thread(target=worker, daemon=True).start()
         
-
     def check_app_updates(self):
         def worker():
             try:
@@ -661,6 +620,7 @@ class OctoWowApp(BaseApp):
                 self.msg_queue.put(("app_update_error", str(e)))
                 
         threading.Thread(target=worker, daemon=True).start()
+
 
     # --- SETTINGS TAB ---
     def build_settings_tab(self):
@@ -1213,12 +1173,14 @@ class OctoWowApp(BaseApp):
             return
             
         files = filedialog.askopenfilenames(title="Select Game Mod (MPQ or ZIP)", filetypes=[("Mod Files", "*.mpq *.zip"), ("All Files", "*.*")])
-        if files: self.handle_dropped_files(files)
+        if files: self.handle_file_drop_list(files)
 
     def handle_file_drop(self, event):
         files = self.tk.splitlist(event.data)
-        if not files: return
-        
+        if files:
+            self.handle_file_drop_list(files)
+
+    def handle_file_drop_list(self, files):
         wow_dir = self.wow_dir.get().strip()
         if not wow_dir or not os.path.exists(os.path.join(wow_dir, "WoW.exe")):
             messagebox.showerror("Error", "Please set a valid WoW directory in Game Settings first.")
@@ -1243,10 +1205,6 @@ class OctoWowApp(BaseApp):
             self.install_dropped_addons(zips)
 
     def handle_dropped_mpqs(self, files):
-        if not self.wow_dir.get().strip() or not os.path.exists(os.path.join(self.wow_dir.get(), "Data")):
-            messagebox.showerror("Error", "Please set a valid WoW directory in Game Settings first.")
-            return
-
         def process_files():
             for f in files:
                 if f.lower().endswith(".mpq"):
@@ -1254,53 +1212,6 @@ class OctoWowApp(BaseApp):
             self.msg_queue.put(("mpq_process_next", None))
             
         threading.Thread(target=process_files, daemon=True).start()
-
-
-    def add_game_mod(self):
-        if not self.wow_dir.get().strip() or not os.path.exists(os.path.join(self.wow_dir.get(), "Data")):
-            messagebox.showerror("Error", "Please set a valid WoW directory in Game Settings first.")
-            return
-            
-        files = filedialog.askopenfilenames(title="Select Game Mod (MPQ)", filetypes=[("MPQ Files", "*.mpq"), ("All Files", "*.*")])
-        if files: self.handle_dropped_mpqs(files)
-
-    def add_custom_dll(self):
-        wow_dir = self.wow_dir.get().strip()
-        if not wow_dir or not os.path.exists(os.path.join(wow_dir, "WoW.exe")):
-            messagebox.showerror("Error", "Please set a valid WoW directory in Game Settings first.")
-            return
-        
-        filepath = filedialog.askopenfilename(title="Select Custom DLL", filetypes=[("DLL Files", "*.dll")])
-        if filepath:
-            self.install_custom_dll(filepath)
-
-    def install_custom_dll(self, filepath):
-        wow_dir = self.wow_dir.get().strip()
-        filename = os.path.basename(filepath)
-        
-        managed_defaults = list(self.core_plugins.keys()) + list(self.optional_plugins.keys())
-        if filename.lower() in [m.lower() for m in managed_defaults]:
-            messagebox.showerror("Error", f"'{filename}' is already managed natively by the app.")
-            return
-            
-        if filename in self.custom_plugins:
-            messagebox.showinfo("Info", f"'{filename}' is already in your custom plugins list.")
-            return
-            
-        target_path = os.path.join(wow_dir, filename)
-        
-        if os.path.normpath(filepath).lower() != os.path.normpath(target_path).lower():
-            try:
-                shutil.copy2(filepath, target_path)
-            except Exception as e:
-                messagebox.showerror("Error", f"Failed to copy DLL to WoW folder:\n{e}")
-                return
-                
-        var = ctk.BooleanVar(value=True)
-        var.trace_add("write", self.save_all_state)
-        self.custom_plugins[filename] = var
-        self.save_all_state()
-        self.refresh_custom_dlls_ui()
 
     def install_dropped_addons(self, zips):
         wow_dir = self.wow_dir.get().strip()
@@ -1311,7 +1222,7 @@ class OctoWowApp(BaseApp):
                 try:
                     AddonManager.install_local_addon(zip_path, addons_dir)
                 except Exception as e:
-                    self.msg_queue.put(("app_update_fail", f"Failed to format and install addon from ZIP ({os.path.basename(zip_path)}):\n{e}"))
+                    self.msg_queue.put(("app_update_error", f"Failed to format and install addon from ZIP ({os.path.basename(zip_path)}):\n{e}"))
             
             self.msg_queue.put(("trigger_addon_scan", None))
             
@@ -1900,7 +1811,8 @@ class OctoWowApp(BaseApp):
         custom_dlls = []
         if os.path.exists(dlls_txt_path):
             try:
-                with open(dlls_txt_path, "r") as f:
+                # Use utf-8-sig to automatically strip hidden Byte Order Marks (BOM)
+                with open(dlls_txt_path, "r", encoding="utf-8-sig", errors="ignore") as f:
                     for line in f:
                         clean_line = line.strip()
                         # If it's not empty and not in our managed list, it's a completely unmanaged background DLL
@@ -1911,7 +1823,7 @@ class OctoWowApp(BaseApp):
                 print(f"Error reading existing dlls.txt: {e}")
 
         # 3. Start building the new file content with our required base
-        dlls_text_lines = ["dxvk"]
+        raw_lines_to_write = ["dxvk"]
 
         def download_github_dll(repo, dest):
             try:
@@ -1945,7 +1857,7 @@ class OctoWowApp(BaseApp):
                 if not dl_success and os.path.exists(source_dll): 
                     shutil.copy2(source_dll, target_dll)
                     
-                dlls_text_lines.append(dll_name) 
+                raw_lines_to_write.append(dll_name) 
 
         # Add enabled optional plugins
         for dll_name, var in self.optional_plugins.items():
@@ -1953,75 +1865,38 @@ class OctoWowApp(BaseApp):
                 source_dll = os.path.join(payload_weirdu, dll_name)
                 target_dll = os.path.join(target, dll_name)
                 if os.path.exists(source_dll): shutil.copy2(source_dll, target_dll)
-                dlls_text_lines.append(dll_name)
+                raw_lines_to_write.append(dll_name)
 
         # Add enabled custom plugins (verifying they actually still exist on the drive)
         for dll_name, var in self.custom_plugins.items():
             if var.get():
                 if os.path.exists(os.path.join(target, dll_name)):
-                    dlls_text_lines.append(dll_name)
+                    raw_lines_to_write.append(dll_name)
                 
         # 4. Append the completely unmanaged background DLLs back to the list
-        dlls_text_lines.extend(custom_dlls)
+        raw_lines_to_write.extend(custom_dlls)
 
-        # 5. Save the final list
+        # 5. STRICT DEDUPLICATION (Preserving Order)
+        # This guarantees that a duplicate can NEVER be written to the file, 
+        # even if the user manually messed with it or there was an encoding glitch.
+        final_dlls_list = []
+        seen = set()
+        for dll in raw_lines_to_write:
+            cleaned = dll.strip()
+            if not cleaned: continue
+            lowered = cleaned.lower()
+            if lowered not in seen:
+                seen.add(lowered)
+                final_dlls_list.append(cleaned)
+
+        # 6. Save the final deduplicated list
         try:
-            with open(dlls_txt_path, "w") as f:
-                f.write("\n".join(dlls_text_lines))
+            with open(dlls_txt_path, "w", encoding="utf-8") as f:
+                f.write("\n".join(final_dlls_list))
         except Exception as e:
             print(f"Failed to write to dlls.txt: {e}")
 
-        def download_github_dll(repo, dest):
-            try:
-                api_url = f"https://api.github.com/repos/{repo}/releases/latest"
-                req = urllib.request.Request(api_url, headers={'User-Agent': 'OctoWowApp'})
-                with urllib.request.urlopen(req, timeout=10) as resp:
-                    data = json.loads(resp.read().decode())
-                
-                dl_url = next((a['browser_download_url'] for a in data.get('assets', []) if a['name'].endswith('.dll')), None)
-                if dl_url:
-                    req = urllib.request.Request(dl_url, headers={'User-Agent': 'OctoWowApp'})
-                    with urllib.request.urlopen(req, timeout=15) as resp, open(dest, 'wb') as f:
-                        shutil.copyfileobj(resp, f)
-                    return True
-            except Exception as e:
-                print(f"Failed to download {repo} from GitHub: {e}")
-            return False
-
-        # Add enabled core plugins
-        for dll_name, var in self.core_plugins.items():
-            if var.get():
-                source_dll = os.path.join(payload_base, dll_name)
-                target_dll = os.path.join(target, dll_name)
-                
-                src_pref = self.plugin_sources.get(dll_name, ctk.StringVar(value="Recommended")).get()
-                dl_success = False
-                
-                if src_pref == "Latest (GitHub)" and dll_name in self.GITHUB_MODS:
-                    dl_success = download_github_dll(self.GITHUB_MODS[dll_name], target_dll)
-                    
-                if not dl_success and os.path.exists(source_dll): 
-                    shutil.copy2(source_dll, target_dll)
-                    
-                dlls_text_lines.append(dll_name) 
-
-        # Add enabled optional plugins
-        for dll_name, var in self.optional_plugins.items():
-            if var.get():
-                source_dll = os.path.join(payload_weirdu, dll_name)
-                target_dll = os.path.join(target, dll_name)
-                if os.path.exists(source_dll): shutil.copy2(source_dll, target_dll)
-                dlls_text_lines.append(dll_name)
-                
-        # 4. Append the user's custom DLLs back to the list
-        dlls_text_lines.extend(custom_dlls)
-
-        # 5. Save the final list
-        try:
-            with open(dlls_txt_path, "w") as f:
-                f.write("\n".join(dlls_text_lines))
-        except Exception as e:
-            print(f"Failed to write to dlls.txt: {e}")
+        
 
     def run_vanilla_tweaks(self, target):
         wow_exe = os.path.join(target, "WoW.exe")
@@ -2198,10 +2073,6 @@ oLink.Save
                         state="normal", 
                         command=lambda: webbrowser.open(self.app_update_url)
                     )
-                elif msg_type == "app_update_none":
-                    self.app_update_btn.grid_forget() 
-                elif msg_type == "app_update_error":
-                    self.app_update_btn.grid_forget()
                 elif msg_type == "app_update_none":
                     self.app_update_btn.grid_forget() 
                 elif msg_type == "app_update_error":
