@@ -32,7 +32,7 @@ except ImportError:
 # --- CONFIGURATION ---
 CLIENT_ZIP_URL = "https://your-server.com/OctoWoW_Client.zip" # <-- CHANGE THIS TO YOUR ACTUAL CLIENT ZIP URL
 CONFIG_FILE = "octowow_config.json"
-VERSION = "2.6"
+VERSION = "2.6.0"
 
 # Standard Vanilla 1.12 MPQ files that should be ignored by the Game Mods manager
 BASE_MPQ_BLACKLIST = {
