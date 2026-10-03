@@ -15,6 +15,8 @@ import ssl
 import socket
 import tempfile
 import webbrowser
+import stat
+import concurrent.futures
 import tkinter as tk
 from tkinter import filedialog, messagebox
 import customtkinter as ctk
@@ -30,7 +32,7 @@ except ImportError:
 # --- CONFIGURATION ---
 CLIENT_ZIP_URL = "https://your-server.com/OctoWoW_Client.zip" # <-- CHANGE THIS TO YOUR ACTUAL CLIENT ZIP URL
 CONFIG_FILE = "octowow_config.json"
-VERSION = "2.5.3"
+VERSION = "2.6"
 
 # Standard Vanilla 1.12 MPQ files that should be ignored by the Game Mods manager
 BASE_MPQ_BLACKLIST = {
@@ -62,6 +64,24 @@ def get_persist_path():
 def get_base_path():
     if getattr(sys, 'frozen', False): return sys._MEIPASS
     return os.path.dirname(os.path.abspath(__file__))
+
+def force_remove_dir(dir_path):
+    """Robustly removes a directory, bypassing read-only attributes on Windows."""
+    if not os.path.exists(dir_path): return True
+    
+    def remove_readonly(func, path, _):
+        try:
+            os.chmod(path, stat.S_IWRITE)
+            func(path)
+        except Exception:
+            pass
+            
+    try:
+        shutil.rmtree(dir_path, onerror=remove_readonly)
+    except Exception:
+        pass
+        
+    return not os.path.exists(dir_path)
 
 def bdecode(data):
     """Dependency-free recursive Bencode parser for torrent mapping."""
@@ -178,6 +198,9 @@ else:
     class BaseApp(ctk.CTk):
         pass
 
+
+
+
 # ==========================================
 # 1. MODEL: CONFIG MANAGER
 # ==========================================
@@ -206,65 +229,106 @@ class ConfigManager:
 # ==========================================
 class AddonManager:
     @staticmethod
-    def get_github_api_info(url):
-        """Resolves the default branch ZIP and SHA commit of a GitHub repo URL."""
-        if "github.com" not in url: return None, url
-        url = url.rstrip('/')
-        if url.endswith(".git"): url = url[:-4]
-        parts = url.split('/')
-        user, repo = parts[-2], parts[-1]
+    def ensure_git():
+        """Downloads portable MinGit in the background if it's missing."""
+        git_dir = os.path.join(get_persist_path(), "MinGit")
+        git_exe = os.path.join(git_dir, "cmd", "git.exe")
         
-        try:
-            req = urllib.request.Request(f"https://api.github.com/repos/{user}/{repo}", headers={'User-Agent': 'OctoWow'})
-            with urllib.request.urlopen(req, timeout=8) as resp:
-                data = json.loads(resp.read().decode())
-                branch = data.get("default_branch", "master")
-                
-            req_commit = urllib.request.Request(f"https://api.github.com/repos/{user}/{repo}/commits/{branch}", headers={'User-Agent': 'OctoWow'})
-            with urllib.request.urlopen(req_commit, timeout=8) as resp:
-                cdata = json.loads(resp.read().decode())
-                sha = cdata.get("sha", "")
-                
-            zip_url = f"https://github.com/{user}/{repo}/archive/refs/heads/{branch}.zip"
-            return sha, zip_url
-        except Exception:
-            # Fallback if rate limited or failing
-            return None, f"https://github.com/{user}/{repo}/archive/refs/heads/master.zip"
-
-    @staticmethod
-    def install_addon(url, addons_dir):
-        """Downloads, extracts, locates .toc, and logically renames addon folders before moving."""
-        sha, zip_url = AddonManager.get_github_api_info(url)
+        if os.path.exists(git_exe):
+            return git_exe
+            
+        print("Downloading portable Git engine...")
+        # Official MinGit release from Git-for-Windows
+        mingit_url = "https://github.com/git-for-windows/git/releases/download/v2.44.0.windows.1/MinGit-2.44.0-64-bit.zip"
         
         with tempfile.TemporaryDirectory() as tmpdir:
-            zip_path = os.path.join(tmpdir, "addon.zip")
-            req = urllib.request.Request(zip_url, headers={'User-Agent': 'Mozilla/5.0'})
-            with urllib.request.urlopen(req, timeout=15) as resp, open(zip_path, 'wb') as f:
+            zip_path = os.path.join(tmpdir, "mingit.zip")
+            req = urllib.request.Request(mingit_url, headers={'User-Agent': 'Mozilla/5.0'})
+            with urllib.request.urlopen(req, timeout=30) as resp, open(zip_path, 'wb') as f:
                 shutil.copyfileobj(resp, f)
                 
             with zipfile.ZipFile(zip_path, 'r') as z:
-                z.extractall(tmpdir)
+                z.extractall(git_dir)
                 
-            extracted_items = [item for item in os.listdir(tmpdir) if item != "addon.zip"]
-            if not extracted_items: raise Exception("ZIP file contained no contents")
+        return git_exe
+
+    @staticmethod
+    def get_git_api_info(url):
+        """Uses portable Git to universally fetch the latest commit SHA from ANY repo."""
+        if not url.startswith("http"): return None, url
+        
+        git_exe = AddonManager.ensure_git()
+        env = os.environ.copy()
+        env["GIT_TERMINAL_PROMPT"] = "0"
+        
+        # Self-hosted servers (Gitea/GitLab) usually require .git to bypass the Web UI HTML
+        git_url = url.rstrip('/')
+        if not git_url.endswith('.git'): 
+            git_url += '.git'
+        
+        try:
+            cmd = [git_exe, "ls-remote", git_url, "HEAD"]
+            result = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=10, creationflags=subprocess.CREATE_NO_WINDOW)
             
-            extracted_root = os.path.join(tmpdir, extracted_items[0])
-            if not os.path.isdir(extracted_root):
-                extracted_root = tmpdir
+            if result.returncode == 0 and result.stdout:
+                sha = result.stdout.split()[0]
+                return sha, url
+        except Exception as e:
+            print(f"Git ls-remote failed for {url}: {e}")
+            
+        return None, url
+
+    @staticmethod
+    def install_addon(url, addons_dir):
+        """Clones the repo using portable Git, locates .toc, and moves it to AddOns."""
+        sha, _ = AddonManager.get_git_api_info(url)
+        git_exe = AddonManager.ensure_git()
+        
+        env = os.environ.copy()
+        env["GIT_TERMINAL_PROMPT"] = "0"
+        
+        git_url = url.rstrip('/')
+        if not git_url.endswith('.git'): 
+            git_url += '.git'
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cmd = [git_exe, "clone", "--depth", "1", git_url, tmpdir]
+            result = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=60, creationflags=subprocess.CREATE_NO_WINDOW)
+            
+            # --- ERROR HANDLING FOR CLOUDFLARE / HTML INTERCEPTS ---
+            if result.returncode != 0:
+                err_out = result.stderr.strip()
+                if "could not determine hash algorithm" in err_out or "not valid" in err_out:
+                    raise Exception(
+                        "The server blocked the download and returned a webpage instead of the addon files.\n\n"
+                        "This almost always means:\n"
+                        "1. The server is under Cloudflare 'Anti-DDoS' protection.\n"
+                        "2. The URL is invalid (e.g., pointing to a sub-folder instead of the main repo).\n"
+                        "3. The repository is Private or was deleted.\n\n"
+                        "WORKAROUND: Open the URL in your web browser, download the .zip manually, "
+                        "and Drag & Drop the .zip file directly into this app!"
+                    )
+                raise Exception(f"Git clone failed:\n{err_out}")
+                
+            git_folder = os.path.join(tmpdir, ".git")
+            if os.path.exists(git_folder):
+                force_remove_dir(git_folder)
                 
             addon_dirs = []
             
-            # 1. Search for .toc files directly in the root of the extracted repo folder
-            tocs_in_root = [f for f in os.listdir(extracted_root) if f.endswith('.toc')]
+            # 1. Search for .toc files directly in the root of the cloned repo
+            tocs_in_root = [f for f in os.listdir(tmpdir) if f.endswith('.toc')]
             if tocs_in_root:
-                addon_dirs.append((extracted_root, tocs_in_root[0][:-4]))
+                tocs_in_root.sort(key=len) # Sort to prioritize Vanilla TOCs over expansion TOCs
+                addon_dirs.append((tmpdir, tocs_in_root[0][:-4]))
             else:
-                # 2. Search deeper in immediate subdirectories (typical for addon-packs like pfUI/DBM)
-                for item in os.listdir(extracted_root):
-                    subpath = os.path.join(extracted_root, item)
+                # 2. Search deeper in immediate subdirectories
+                for item in os.listdir(tmpdir):
+                    subpath = os.path.join(tmpdir, item)
                     if os.path.isdir(subpath):
                         tocs = [f for f in os.listdir(subpath) if f.endswith('.toc')]
                         if tocs:
+                            tocs.sort(key=len)
                             addon_dirs.append((subpath, tocs[0][:-4]))
                             
             if not addon_dirs:
@@ -274,7 +338,8 @@ class AddonManager:
             for src, name in addon_dirs:
                 dest = os.path.join(addons_dir, name)
                 if os.path.exists(dest):
-                    shutil.rmtree(dest, ignore_errors=True)
+                    if not force_remove_dir(dest):
+                        raise Exception(f"Failed to clear existing addon folder: '{name}'. Please make sure the game is closed.")
                 shutil.move(src, dest)
                 
                 # Save metadata for update tracking
@@ -292,36 +357,35 @@ class AddonManager:
             extracted_items = [item for item in os.listdir(tmpdir)]
             if not extracted_items: raise Exception("ZIP file contained no contents")
             
-            # Find the root containing the data
             extracted_root = os.path.join(tmpdir, extracted_items[0])
             if not os.path.isdir(extracted_root) or len(extracted_items) > 1:
                 extracted_root = tmpdir
                 
             addon_dirs = []
             
-            # 1. Search for .toc files directly in the root
             tocs_in_root = [f for f in os.listdir(extracted_root) if f.endswith('.toc')]
             if tocs_in_root:
+                tocs_in_root.sort(key=len)
                 addon_dirs.append((extracted_root, tocs_in_root[0][:-4]))
             else:
-                # 2. Search deeper in immediate subdirectories (typical for addon-packs)
                 for item in os.listdir(extracted_root):
                     subpath = os.path.join(extracted_root, item)
                     if os.path.isdir(subpath):
                         tocs = [f for f in os.listdir(subpath) if f.endswith('.toc')]
                         if tocs:
+                            tocs.sort(key=len)
                             addon_dirs.append((subpath, tocs[0][:-4]))
                             
             if not addon_dirs:
                 raise Exception("No .toc (addon configuration files) found in this ZIP.")
                 
-            # Move the correct folders out and rename them to match the TOC
             for src, name in addon_dirs:
                 dest = os.path.join(addons_dir, name)
                 if os.path.exists(dest):
-                    shutil.rmtree(dest, ignore_errors=True)
+                    if not force_remove_dir(dest):
+                        raise Exception(f"Failed to clear existing addon folder: '{name}'. Please make sure the game is closed.")
                 shutil.move(src, dest)
-
+                
 # ==========================================
 # 3. VIEW & CONTROLLER: UI AND INSTALL LOGIC
 # ==========================================
@@ -1313,31 +1377,41 @@ class OctoWowApp(BaseApp):
 
 
     # --- ADDON MANAGER TAB ---
+    # ==========================================
+    # --- ADDON MANAGER TAB (REBUILT) ---
+    # ==========================================
     def build_addons_tab(self):
         frame = ctk.CTkFrame(self.main_container, fg_color=BG_COLOR)
         self.frames["Addons"] = frame
 
+        # Header Area
         top = ctk.CTkFrame(frame, fg_color="transparent")
         top.pack(fill="x", padx=10, pady=(10, 5))
-        ctk.CTkLabel(top, text="Addon Manager", font=("Segoe UI", 24, "bold"), text_color=TEXT_MAIN).pack(side="left")
-        ctk.CTkButton(top, text="🔄 Refresh List", fg_color=CARD_COLOR, hover_color="#2A2E3F", font=("Segoe UI", 12, "bold"), command=lambda: self.trigger_addon_scan(show_loading=True)).pack(side="right")
+        ctk.CTkLabel(top, text="📦 Addon Manager", font=("Segoe UI", 24, "bold"), text_color=TEXT_MAIN).pack(side="left")
+        
+        self.btn_refresh_addons = ctk.CTkButton(top, text="🔄 Refresh List", fg_color=CARD_COLOR, hover_color="#2A2E3F", font=("Segoe UI", 12, "bold"), command=lambda: self.trigger_addon_scan(show_loading=True))
+        self.btn_refresh_addons.pack(side="right")
 
-        ctk.CTkLabel(frame, text="Automatically scans your WoW directory. Provide a GitHub URL to install standard addons directly.", text_color=TEXT_MUTED).pack(anchor="w", padx=10, pady=(0, 15))
+        ctk.CTkLabel(frame, text="Install directly from Git repositories, or drop a .zip file. Updates are fully automatic.", text_color=TEXT_MUTED).pack(anchor="w", padx=10, pady=(0, 15))
 
+        # Controls Area
         ctrl_frame = ctk.CTkFrame(frame, fg_color="transparent")
-        ctrl_frame.pack(fill="x", padx=10, pady=(10, 15))
+        ctrl_frame.pack(fill="x", padx=10, pady=(0, 15))
 
         add_frame = ctk.CTkFrame(ctrl_frame, fg_color=SURFACE_COLOR, corner_radius=8)
         add_frame.pack(side="left", fill="x", expand=True, padx=(0, 10))
+        
         self.addon_url_var = ctk.StringVar()
-        ctk.CTkEntry(add_frame, textvariable=self.addon_url_var, placeholder_text="https://github.com/username/addon", fg_color=BG_COLOR, border_color=CARD_COLOR).pack(side="left", fill="x", expand=True, padx=(15, 10), pady=10)
-        ctk.CTkButton(add_frame, text="➕ Install from GitHub", width=160, fg_color=CARD_COLOR, hover_color="#2A2E3F", font=("Segoe UI", 12, "bold"), command=self.add_addon).pack(side="left", padx=(0, 15), pady=10)
+        ctk.CTkEntry(add_frame, textvariable=self.addon_url_var, placeholder_text="Paste URL (e.g., https://github.com/user/addon)", fg_color=BG_COLOR, border_color=CARD_COLOR).pack(side="left", fill="x", expand=True, padx=(15, 10), pady=10)
+        
+        self.btn_add_addon = ctk.CTkButton(add_frame, text="➕ Install Addon", width=140, fg_color=ACCENT_COLOR, hover_color=ACCENT_HOVER, font=("Segoe UI", 12, "bold"), command=self.add_addon)
+        self.btn_add_addon.pack(side="left", padx=(0, 15), pady=10)
 
         search_frame = ctk.CTkFrame(ctrl_frame, fg_color=SURFACE_COLOR, corner_radius=8)
         search_frame.pack(side="right")
         self.search_var = ctk.StringVar()
         self.search_var.trace_add("write", lambda *args: self.filter_addons_ui())
-        ctk.CTkEntry(search_frame, textvariable=self.search_var, placeholder_text="🔍 Search Addons...", width=180, fg_color=BG_COLOR, border_color=CARD_COLOR).pack(padx=15, pady=10)
+        ctk.CTkEntry(search_frame, textvariable=self.search_var, placeholder_text="🔍 Search installed...", width=200, fg_color=BG_COLOR, border_color=CARD_COLOR).pack(padx=15, pady=10)
 
         self.addon_scroll = SmoothScrollableFrame(frame, fg_color="transparent")
         self.addon_scroll.pack(fill="both", expand=True, padx=5)
@@ -1345,6 +1419,7 @@ class OctoWowApp(BaseApp):
     def trigger_addon_scan(self, show_loading=True):
         if self.is_scanning_addons: return
         self.is_scanning_addons = True
+        self.btn_refresh_addons.configure(state="disabled")
         
         if show_loading:
             for widget in self.addon_scroll.winfo_children(): widget.destroy()
@@ -1352,11 +1427,12 @@ class OctoWowApp(BaseApp):
             load_frame.pack(expand=True, pady=40)
             ctk.CTkLabel(load_frame, text="⏳", font=("Segoe UI", 36)).pack(pady=(0,10))
             ctk.CTkLabel(load_frame, text="Scanning Addons...", font=("Segoe UI", 16, "bold"), text_color=ACCENT_COLOR).pack()
-            ctk.CTkLabel(load_frame, text="This might take a minute depending on how many addons you have.", text_color=TEXT_MUTED).pack()
+            ctk.CTkLabel(load_frame, text="Checking repositories for updates...", text_color=TEXT_MUTED).pack()
         
         threading.Thread(target=self.scan_addons_thread, daemon=True).start()
 
-    def strip_wow_colors(self, text): return re.sub(r'\|c[0-9a-fA-F]{8}|\|r', '', text).strip()
+    def strip_wow_colors(self, text): 
+        return re.sub(r'\|c[0-9a-fA-F]{8}|\|r', '', text).strip()
 
     def parse_toc(self, toc_path):
         metadata = {"Title": "", "Version": "Unknown", "Notes": "No description provided.", "Author": "Unknown"}
@@ -1376,55 +1452,63 @@ class OctoWowApp(BaseApp):
         wow_dir = self.wow_dir.get().strip()
         addons_dir = os.path.join(wow_dir, "Interface", "AddOns")
         addon_data = []
+        found_urls = set() # Track URLs that are successfully mapped to an installed folder
         
         if os.path.exists(addons_dir):
-            for folder in os.listdir(addons_dir):
-                if folder.startswith(("Blizzard_", "Turtle_")): continue
+            folders = [f for f in os.listdir(addons_dir) if os.path.isdir(os.path.join(addons_dir, f)) and not f.startswith(("Blizzard_", "Turtle_"))]
+            
+            # 1. Parse local installations
+            for folder in folders:
                 fpath = os.path.join(addons_dir, folder)
-                if os.path.isdir(fpath):
+                meta_path = os.path.join(fpath, ".octowow_meta")
+                meta_data_json = {}
+                if os.path.exists(meta_path):
+                    try:
+                        with open(meta_path, 'r') as f: meta_data_json = json.load(f)
+                    except: pass
                     
-                    # Check for our tracker meta to know if we manage it
-                    meta_path = os.path.join(fpath, ".octowow_meta")
-                    meta_data_json = {}
-                    if os.path.exists(meta_path):
-                        try:
-                            with open(meta_path, 'r') as f: meta_data_json = json.load(f)
-                        except: pass
-                        
-                    url = meta_data_json.get("url") or next((u for u in self.tracked_addons if u.rstrip('/').split('/')[-1].replace('.git','') == folder), None)
-
-                    # Update logic: If it's a URL we manage, we fetch the latest SHA from github to flag it. 
-                    # This gracefully handles rate-limiting without crashing.
-                    needs_update = False
-                    if url and "github.com" in url:
-                        remote_sha, _ = AddonManager.get_github_api_info(url)
-                        if remote_sha and meta_data_json.get("sha") and remote_sha != meta_data_json.get("sha"):
-                            needs_update = True
-
-                    toc_path = os.path.join(fpath, f"{folder}.toc")
-                    meta = self.parse_toc(toc_path)
-
-                    addon_data.append({
-                        "folder": folder,
-                        "title": meta["Title"] if meta["Title"] else folder,
-                        "version": meta["Version"],
-                        "author": meta["Author"],
-                        "notes": meta["Notes"],
-                        "needs_update": needs_update,
-                        "url": url,
-                        "missing": False,
-                        "managed": bool(url)
-                    })
-        
-        for url in self.tracked_addons:
-            folder = url.rstrip('/').split('/')[-1].replace('.git','')
-            if not any(a["folder"] == folder or (a.get("url") == url) for a in addon_data):
-                addon_data.append({
-                    "folder": folder, "title": folder, "version": "-", "author": "-",
-                    "notes": f"Will be downloaded on next update.",
-                    "needs_update": False, "url": url, "missing": True, "managed": True
-                })
+                url = meta_data_json.get("url") or next((u for u in self.tracked_addons if u.rstrip('/').split('/')[-1].replace('.git','') == folder), None)
                 
+                if url:
+                    found_urls.add(url) # Mark this URL as successfully installed
+                    
+                toc_path = os.path.join(fpath, f"{folder}.toc")
+                meta = self.parse_toc(toc_path)
+
+                addon_data.append({
+                    "folder": folder,
+                    "title": meta["Title"] if meta["Title"] else folder,
+                    "version": meta["Version"],
+                    "author": meta["Author"],
+                    "notes": meta["Notes"],
+                    "url": url,
+                    "local_sha": meta_data_json.get("sha"),
+                    "needs_update": False,
+                    "missing": False,
+                    "managed": bool(url)
+                })
+
+        # 2. Append tracked addons ONLY if their URL wasn't found in any of the folders above
+        for url in self.tracked_addons:
+            if url not in found_urls:
+                folder_guess = url.rstrip('/').split('/')[-1].replace('.git','')
+                addon_data.append({
+                    "folder": folder_guess, "title": folder_guess, "version": "Unknown", "author": "Unknown",
+                    "notes": "This addon is managed by OctoWoW but the files are missing from your drive.",
+                    "url": url, "local_sha": None, "needs_update": False, "missing": True, "managed": True
+                })
+
+        # 3. Check for updates parallelly (blazing fast)
+        def check_update(addon):
+            if addon["managed"] and addon["url"] and addon["url"].startswith("http"):
+                remote_sha, _ = AddonManager.get_git_api_info(addon["url"])
+                if remote_sha and remote_sha != addon.get("local_sha"):
+                    addon["needs_update"] = True
+            return addon
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+            addon_data = list(executor.map(check_update, addon_data))
+            
         self.msg_queue.put(("render_addons", addon_data))
 
     def build_all_addon_cards(self, addon_data):
@@ -1444,7 +1528,7 @@ class OctoWowApp(BaseApp):
         self.no_results_lbl = ctk.CTkLabel(self.addon_scroll, text="No addons match your search.", text_color=TEXT_MUTED)
 
         if not addon_data:
-            self.no_results_lbl.configure(text="No addons found. Set your WoW directory or provide a GitHub URL.")
+            self.no_results_lbl.configure(text="No addons found. Install one from Git or drop a .zip file above.")
             self.no_results_lbl.pack(pady=40)
             return
 
@@ -1485,36 +1569,33 @@ class OctoWowApp(BaseApp):
             self.no_results_lbl.pack(pady=40)
 
     def create_addon_card_widget(self, addon):
-        card = ctk.CTkFrame(self.addon_scroll, fg_color=SURFACE_COLOR, corner_radius=8, height=75)
-        card.pack_propagate(False)
+        card = ctk.CTkFrame(self.addon_scroll, fg_color=SURFACE_COLOR, corner_radius=8)
         card.grid_columnconfigure(1, weight=1)
         
-        icon_color = ACCENT_COLOR if addon["managed"] else TEXT_MUTED
-        ctk.CTkLabel(card, text="📦", font=("Segoe UI", 24), text_color=icon_color).grid(row=0, column=0, padx=(15, 10), pady=18)
+        icon_color = SUCCESS_COLOR if addon["managed"] and not addon["missing"] and not addon["needs_update"] else (WARNING_COLOR if addon["needs_update"] else ERROR_COLOR if addon["missing"] else TEXT_MUTED)
+        icon_lbl = ctk.CTkLabel(card, text="📦", font=("Segoe UI", 32), text_color=icon_color)
+        icon_lbl.grid(row=0, column=0, padx=(20, 15), pady=20, sticky="n")
         
         info_frame = ctk.CTkFrame(card, fg_color="transparent")
-        info_frame.grid(row=0, column=1, sticky="w", pady=15)
+        info_frame.grid(row=0, column=1, sticky="nsew", pady=15)
         
-        title_color = TEXT_MAIN if not addon["missing"] else ERROR_COLOR
-        ctk.CTkLabel(info_frame, text=addon["title"], font=("Segoe UI", 15, "bold"), text_color=title_color).pack(anchor="w")
+        title_text = addon["title"]
+        if addon["missing"]: title_text += " (Missing Files)"
+        ctk.CTkLabel(info_frame, text=title_text, font=("Segoe UI", 16, "bold"), text_color=TEXT_MAIN).pack(anchor="w")
         
-        sub_text = f"v{addon['version']}  •  By {addon['author']}"
-        if addon["missing"]: sub_text = "Missing (Will download on update)"
-        sub_lbl = ctk.CTkLabel(info_frame, text=sub_text, font=("Segoe UI", 11), text_color=TEXT_MUTED)
-        sub_lbl.pack(anchor="w")
+        meta_str = f"Version: {addon['version']}  •  Author: {addon['author']}  •  Folder: {addon['folder']}"
+        ctk.CTkLabel(info_frame, text=meta_str, font=("Segoe UI", 11), text_color=TEXT_MUTED).pack(anchor="w", pady=(2, 8))
+        
+        ctk.CTkLabel(info_frame, text=addon["notes"], font=("Segoe UI", 12), text_color=TEXT_MAIN, wraplength=550, justify="left").pack(anchor="w")
 
         btn_frame = ctk.CTkFrame(card, fg_color="transparent")
-        btn_frame.grid(row=0, column=2, sticky="e", padx=15, pady=18)
+        btn_frame.grid(row=0, column=2, sticky="e", padx=20, pady=20)
         
         upd_btn = None
         if addon["needs_update"] or addon["missing"]:
-            upd_btn = ctk.CTkButton(btn_frame, text="⬇ Update", font=("Segoe UI", 12, "bold"), fg_color=WARNING_COLOR, hover_color="#D97706", width=100)
+            btn_text = "⬇ Repair" if addon["missing"] else "⬇ Update"
+            upd_btn = ctk.CTkButton(btn_frame, text=btn_text, font=("Segoe UI", 12, "bold"), fg_color=WARNING_COLOR, hover_color="#D97706", width=100)
             upd_btn.pack(side="left", padx=(0, 10))
-
-        btn_info = ctk.CTkButton(btn_frame, text="i", font=("Georgia", 16, "bold"), width=32, height=32, corner_radius=16, 
-                                 fg_color=INFO_COLOR, hover_color="#2563EB", command=lambda a=addon: self.show_addon_details(a))
-        btn_info.pack(side="left", padx=(0, 10))
-        CTkToolTip(btn_info, "View Description")
 
         btn_del = ctk.CTkButton(btn_frame, text="🗑", font=("Segoe UI Emoji", 14), width=32, height=32, corner_radius=16, 
                                 fg_color=ERROR_COLOR, hover_color="#DC2626", command=lambda a=addon: self.prompt_delete_addon(a["folder"], a["url"]))
@@ -1527,55 +1608,52 @@ class OctoWowApp(BaseApp):
         if upd_btn:
             upd_btn.configure(command=lambda: self.start_single_update(addon, upd_btn, pb))
             
-        card.ui_elements = {'sub_lbl': sub_lbl, 'upd_btn': upd_btn, 'pb': pb, 'btn_frame': btn_frame, 'btn_info': btn_info, 'btn_del': btn_del}
+        card.ui_elements = {'upd_btn': upd_btn, 'pb': pb, 'btn_frame': btn_frame, 'btn_del': btn_del}
         return card
-
-    def show_addon_details(self, addon):
-        top = tk.Toplevel(self)
-        top.title("Addon Details")
-        top.geometry("450x320")
-        top.resizable(False, False)
-        top.attributes("-topmost", True)
-        
-        x = self.winfo_x() + (self.winfo_width() // 2) - 225
-        y = self.winfo_y() + (self.winfo_height() // 2) - 160
-        top.geometry(f"+{x}+{y}")
-        
-        frame = ctk.CTkFrame(top, fg_color=BG_COLOR, corner_radius=0)
-        frame.pack(fill="both", expand=True)
-        
-        ctk.CTkLabel(frame, text="📦 " + addon["title"], font=("Segoe UI", 18, "bold"), text_color=ACCENT_COLOR).pack(pady=(20, 5))
-        ctk.CTkLabel(frame, text=f"Version: {addon['version']}  |  Author: {addon['author']}", font=("Segoe UI", 12), text_color=TEXT_MUTED).pack()
-        
-        box = ctk.CTkScrollableFrame(frame, fg_color=SURFACE_COLOR, corner_radius=8)
-        box.pack(fill="both", expand=True, padx=20, pady=20)
-        
-        ctk.CTkLabel(box, text=addon["notes"], font=("Segoe UI", 12), text_color=TEXT_MAIN, wraplength=370, justify="left").pack(anchor="nw", padx=10, pady=10)
 
     def add_addon(self):
         url = self.addon_url_var.get().strip()
-        if url and url not in self.tracked_addons:
-            self.tracked_addons.append(url)
-            self.save_all_state()
-            self.addon_url_var.set("")
-            self.trigger_addon_scan(show_loading=True)
+        if not url: return
+        
+        wow_dir = self.wow_dir.get().strip()
+        if not wow_dir or not os.path.exists(os.path.join(wow_dir, "WoW.exe")):
+            messagebox.showerror("Error", "Please set a valid WoW directory in Game Settings first.")
+            return
+
+        # Immediate feedback
+        self.btn_add_addon.configure(state="disabled", text="⏳ Installing...")
+        
+        def worker():
+            addons_dir = os.path.join(wow_dir, "Interface", "AddOns")
+            try:
+                AddonManager.install_addon(url, addons_dir)
+                self.msg_queue.put(("install_addon_done", (url, True, "")))
+            except Exception as e:
+                self.msg_queue.put(("install_addon_done", (url, False, str(e))))
+                
+        threading.Thread(target=worker, daemon=True).start()
 
     def prompt_delete_addon(self, folder, url):
         if messagebox.askyesno("Confirm Delete", f"Are you sure you want to completely uninstall and delete {folder}?"):
+            wow_dir = self.wow_dir.get().strip()
+            addon_path = os.path.join(wow_dir, "Interface", "AddOns", folder)
+            
+            if os.path.exists(addon_path):
+                success = force_remove_dir(addon_path)
+                if not success:
+                    messagebox.showerror("Error", f"Failed to completely remove {folder}.\n\nPlease ensure the game is closed and try again.")
+                    self.trigger_addon_scan(show_loading=True)
+                    return 
+                    
             if url and url in self.tracked_addons:
                 self.tracked_addons.remove(url)
                 self.save_all_state()
                 
-            wow_dir = self.wow_dir.get().strip()
-            addon_path = os.path.join(wow_dir, "Interface", "AddOns", folder)
-            if os.path.exists(addon_path): shutil.rmtree(addon_path, ignore_errors=True)
-                
             self.trigger_addon_scan(show_loading=True)
 
-    # --- IN-PLACE INDIVIDUAL ADDON UPDATING ---
     def start_single_update(self, addon, upd_btn, pb):
         upd_btn.pack_forget()
-        pb.pack(fill="x", side="bottom")
+        pb.grid(row=1, column=0, columnspan=3, sticky="ew")
         pb.start()
         
         wow_dir = self.wow_dir.get().strip()
@@ -1585,18 +1663,16 @@ class OctoWowApp(BaseApp):
             folder = addon["folder"]
             try:
                 url = addon["url"]
-                if url:
-                    AddonManager.install_addon(url, addons_dir)
-                self.msg_queue.put(("single_update_done", (folder, True)))
+                if url: AddonManager.install_addon(url, addons_dir)
+                self.msg_queue.put(("single_update_done", (folder, True, "")))
             except Exception as e:
-                print(f"Failed to fetch {folder}: {e}")
-                self.msg_queue.put(("single_update_done", (folder, False)))
+                print(f"Failed to update {folder}: {e}")
+                self.msg_queue.put(("single_update_done", (folder, False, str(e))))
                 
         threading.Thread(target=worker, daemon=True).start()
 
     def sync_all_available_updates(self):
         self.btn_upd_all.configure(state="disabled", text="Updating...")
-        
         updates = [c for c in self.addon_cards if c['type'] == 'update']
         for c in updates:
             addon = c['data']
@@ -1604,49 +1680,6 @@ class OctoWowApp(BaseApp):
             if ui['upd_btn'] and ui['upd_btn'].winfo_ismapped():
                 self.start_single_update(addon, ui['upd_btn'], ui['pb'])
 
-    def rescan_single_addon(self, folder):
-        target_card = None
-        for c in self.addon_cards:
-            if c['data']['folder'] == folder:
-                target_card = c
-                break
-        if not target_card: return
-        
-        wow_dir = self.wow_dir.get().strip()
-        fpath = os.path.join(wow_dir, "Interface", "AddOns", folder)
-        meta = self.parse_toc(os.path.join(fpath, f"{folder}.toc"))
-        
-        addon = target_card['data']
-        addon['title'] = meta["Title"] if meta["Title"] else folder
-        addon['version'] = meta["Version"]
-        addon['author'] = meta["Author"]
-        addon['notes'] = meta["Notes"]
-        addon['needs_update'] = False
-        addon['missing'] = False
-        
-        target_card['type'] = 'installed'
-        
-        ui = target_card['frame'].ui_elements
-        ui['sub_lbl'].configure(text=f"v{addon['version']}  •  By {addon['author']}")
-        ui['pb'].stop()
-        ui['pb'].pack_forget()
-        
-        for w in ui['btn_frame'].winfo_children(): w.destroy()
-        
-        ctk.CTkLabel(ui['btn_frame'], text="✔️ Updated", text_color=SUCCESS_COLOR, font=("Segoe UI", 13, "bold")).pack(side="left", padx=(0, 15))
-        
-        btn_info = ctk.CTkButton(ui['btn_frame'], text="i", font=("Georgia", 16, "bold"), width=32, height=32, corner_radius=16, 
-                                 fg_color=INFO_COLOR, hover_color="#2563EB", command=lambda a=addon: self.show_addon_details(a))
-        btn_info.pack(side="left", padx=(0, 10))
-        CTkToolTip(btn_info, "View Description")
-
-        btn_del = ctk.CTkButton(ui['btn_frame'], text="🗑", font=("Segoe UI Emoji", 14), width=32, height=32, corner_radius=16, 
-                                fg_color=ERROR_COLOR, hover_color="#DC2626", command=lambda a=addon: self.prompt_delete_addon(a["folder"], a["url"]))
-        btn_del.pack(side="left")
-        CTkToolTip(btn_del, "Uninstall Addon")
-
-        if not any(c['type'] == 'update' for c in self.addon_cards):
-            self.btn_upd_all.pack_forget()
 
     # --- GAME UPDATER TAB ---
     def build_updater_tab(self):
@@ -2019,11 +2052,28 @@ oLink.Save
                 msg_type, data = self.msg_queue.get_nowait()
                 if msg_type == "render_addons":
                     self.is_scanning_addons = False
+                    self.btn_refresh_addons.configure(state="normal")
                     self.build_all_addon_cards(data)
+                    
+                elif msg_type == "install_addon_done":
+                    url, success, err_msg = data
+                    self.btn_add_addon.configure(state="normal", text="➕ Install Addon")
+                    
+                    if success:
+                        if url not in self.tracked_addons:
+                            self.tracked_addons.append(url)
+                            self.save_all_state()
+                        self.addon_url_var.set("") # Clear input to show it succeeded
+                        self.trigger_addon_scan(show_loading=True)
+                    else:
+                        messagebox.showerror("Install Failed", f"Failed to install addon from Git.\n\nDetails:\n{err_msg}")
+                        
                 elif msg_type == "single_update_done":
-                    folder, success = data
-                    if not success: messagebox.showerror("Update Failed", f"Failed to download or parse {folder}. Please check the URL or GitHub API limits.")
-                    self.rescan_single_addon(folder)
+                    folder, success, err_msg = data
+                    if not success: 
+                        messagebox.showerror("Update Failed", f"Failed to update: {folder}\n\nDetails:\n{err_msg}")
+                    # Silently refresh the list to re-render the card with the new updated info
+                    self.trigger_addon_scan(show_loading=False)
                 elif msg_type == "mpq_process_next":
                     self.process_next_pending_mpq()
                 elif msg_type == "client_dl_progress":
